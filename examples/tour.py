@@ -4,7 +4,7 @@
 
 它做的事：
 
-  1. 现场训一个小 BPE，把中英各一句话变成 id；
+  1. 现场训一个小 BPE，把英德各一句话变成 id；
   2. 建一个 tiny 模型（随机权重）；
   3. 手工走一遍前向，把每一步的张量形状打出来；
   4. 用贪心解码生成几个 token（随机模型，输出当然不通顺）；
@@ -53,14 +53,14 @@ def main() -> None:
     )
     print(tokenizer.summary())
 
-    source = "the engineer will discuss the problem tomorrow at school."
-    reference = "这位工程师明天在学校会讨论这个问题。"
+    source = "The engineer will discuss the problem tomorrow at school."
+    reference = "Der Ingenieur wird das Problem morgen in der Schule besprechen."
     src_ids = tokenizer.encode(source, add_eos=True)
     tgt_ids = tokenizer.encode(reference, add_bos=True, add_eos=True)
     print(f"\n英文：{source}")
     print(f"  分词：{tokenizer.tokenize(source)}")
     print(f"  id  ：{src_ids}")
-    print(f"中文：{reference}")
+    print(f"德语：{reference}")
     print(f"  分词：{tokenizer.tokenize(reference)}")
     print(f"  id  ：{tgt_ids}")
     print(f"\n解码回来：{tokenizer.decode(src_ids)} / {tokenizer.decode(tgt_ids)}")
@@ -81,7 +81,7 @@ def main() -> None:
     # 而不是按完整目标句（长度 T）—— 行列分别对应 query 和 key 的位置。
     tgt_mask = make_decoder_self_attn_mask(decoder_input, tokenizer.pad_id)
     print(f"src            {tuple(src.shape)}   英文 id（含 <eos>）")
-    print(f"tgt            {tuple(tgt.shape)}   中文 id（<bos> ... <eos>）")
+    print(f"tgt            {tuple(tgt.shape)}   德文 id（<bos> ... <eos>）")
     print(f"解码器输入      {tuple(decoder_input.shape)}   = tgt[:, :-1]")
     print(f"labels         {tuple(labels.shape)}   = tgt[:, 1:]")
     print(f"src_mask       {tuple(src_mask.shape)}   True = 不许看（padding）")
@@ -116,8 +116,8 @@ def main() -> None:
     print(f"编码器第 1 层自注意力：{tuple(first_layer.shape)}  = [batch, heads, 查询位置, 被看位置]")
     print(f"  每一行加起来 = {first_layer.sum(-1).flatten()[0].item():.4f}（softmax 之后必为 1）")
     cross = decoder_weights[0]["cross"]
-    print(f"解码器第 1 层交叉注意力：{tuple(cross.shape)}  = [batch, heads, 中文位置, 英文位置]")
-    print("  它的形状就是一张「翻译对齐表」：第 i 行 = 写第 i 个中文字时看英文的权重分布")
+    print(f"解码器第 1 层交叉注意力：{tuple(cross.shape)}  = [batch, heads, 德文位置, 英文位置]")
+    print("  它的形状就是一张「翻译对齐表」：第 i 行 = 写第 i 个德语词时看英文的权重分布")
 
     # ---------------------------------------------------------------- 5. 解码
     rule("第 6 步：贪心解码（随机权重，输出必然不通顺）")
@@ -136,7 +136,7 @@ def main() -> None:
     print("2. python -m nmt.train --preset small --max-steps 500")
     print("3. python -m nmt.inspect  --checkpoint checkpoints/best.pt --shapes --html attention.html")
     print("4. python -m nmt.verify   --preset tiny --dtype float64   # 和官方实现对齐")
-    print("5. python -m pytest tests -q                      # 62 个不变量测试")
+    print("5. python -m pytest tests -q                      # 64 个不变量测试")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""端到端冒烟测试：造数据 -> 训练几步 -> 翻译，确认整条链路能跑通。
+"""端到端冒烟测试：造数据 -> 训练几步 -> 翻译，确认整条链路能跑通（英译德）。
 
 它不联网、不用真实语料，只验证"代码没写错"。
 真实翻译质量和 BLEU 要用 WMT 数据单独评测。
@@ -56,11 +56,12 @@ def test_training_and_translation_end_to_end(tmp_path) -> None:
     assert (save_dir / "vocab.json").exists()
 
     translator = Translator(save_dir / "best.pt", device="cpu", beam_size=1)
-    output = translator.translate_one("he will finish the project tomorrow at school.")
+    output = translator.translate_one("He will finish the project tomorrow at school.")
     assert isinstance(output, str)
     assert len(output) > 0
-    # 结果应该是中文，而不是把英文照抄回来
-    assert any("\u4e00" <= ch <= "\u9fff" for ch in output)
+    # 至少要吐出一段有字母的德文（模型只有 20 万参数、训了几百步，
+    # 这里只验证"链路通"，不验证翻译质量）
+    assert any(ch.isalpha() for ch in output)
 
 
 def test_resume_continues_from_checkpoint(tmp_path) -> None:

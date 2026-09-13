@@ -16,12 +16,15 @@ BLEU 在算什么？
    那么最多只算命中 3 次。否则刷同一个词就能刷高分数。
 2. **BP 存在的理由**：不惩罚长度的话，"the" 这一个高精度短句就能骗到高分。
    BP = min(1, exp(1 - 参考长度/译文长度))。
-3. **中文要用字级切分**：中文没有空格，BLEU 必须先切词。
-   主流做法是把每个汉字当成一个 token（本项目 `tokenize_for_bleu` 就是这么做的），
-   所以中文 BLEU 的分数普遍比英文低，这是正常的，不要和英文分数横向比。
+3. **切词方式必须固定**：BLEU 不是"跨语言可比"的指标。
+   同一个模型，换个切词方式（整词 / 子词 / 字符）分数就变了。
+   本项目英德两边都用"转小写 + 只保留字母数字串"的简化 13a 分词，
+   和 sacrebleu 的 `13a` 基本一致，所以你算出来的数字大致能和别人对齐。
 
-chrF 则是按**字符 n-gram** 算 F 值，对中文这种"字是有意义单位"的语言更友好，
-训练早期 BLEU 还是 0 的时候，chrF 往往已经在动了 —— 用它观察"有没有在学"更灵敏。
+chrF 则是按**字符 n-gram** 算 F 值，对形态变化多的语言（德语的名词复数、
+形容词词尾、动词变位）更宽容：词形错一半时 BLEU 会掉很多，chrF 还能反映出
+"主干译对了"。训练早期 BLEU 还是 0 的时候，chrF 往往已经在动了 ——
+用它观察"有没有在学"更灵敏。
 """
 
 from __future__ import annotations
@@ -32,31 +35,15 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff]")
-_WORD = re.compile(r"[a-z0-9]+")
+# 13a 思路的简化版：Unicode 字母串 + 数字串；标点整个丢掉。
+# （ä ö ü ß é 都会被 [^\W\d_] 匹配到，不会被误伤）
+_WORD = re.compile(r"[^\W\d_]+|\d+(?:[.,]\d+)*")
 
 
-def tokenize_for_bleu(text: str, lang: str = "zh") -> List[str]:
-    """BLEU 用的切分。
+def tokenize_for_bleu(text: str) -> List[str]:
+    """BLEU 用的切分：转小写，只保留字母串和数字串，标点丢掉。"""
 
-    lang="zh"：汉字逐字切，连续的字母数字保留成词，标点丢掉（同 sacrebleu 的 zh 分词器思路）
-    lang="en"：转小写，按词切，标点丢掉
-    """
-
-    text = text.lower()
-    if lang == "zh":
-        tokens: List[str] = []
-        for char in text:
-            if _CJK.match(char):
-                tokens.append(char)
-            elif char.isalnum():
-                # 字母数字（含全角）单独成词，避免 "abc中文" 粘在一起
-                if tokens and tokens[-1].isalnum() and not _CJK.match(tokens[-1][0]):
-                    tokens[-1] += char
-                else:
-                    tokens.append(char)
-        return tokens
-    return _WORD.findall(text)
+    return _WORD.findall(text.lower())
 
 
 def _extract_ngrams(tokens: Sequence[str], order: int) -> Counter:
@@ -83,7 +70,6 @@ class BLEUScore:
 def corpus_bleu(
     hypotheses: Sequence[str],
     references: Sequence[str],
-    lang: str = "zh",
     max_order: int = 4,
 ) -> BLEUScore:
     """语料级 BLEU。
@@ -103,8 +89,8 @@ def corpus_bleu(
     ref_len_total = 0
 
     for hypothesis, reference in zip(hypotheses, references):
-        hyp_tokens = tokenize_for_bleu(hypothesis, lang)
-        ref_tokens = tokenize_for_bleu(reference, lang)
+        hyp_tokens = tokenize_for_bleu(hypothesis)
+        ref_tokens = tokenize_for_bleu(reference)
         hyp_len_total += len(hyp_tokens)
         ref_len_total += len(ref_tokens)
 
@@ -148,7 +134,7 @@ def corpus_bleu(
 
 
 def _char_ngrams(text: str, order: int) -> Counter:
-    """按字符切 n-gram（去掉空白，中英都适用）。"""
+    """按字符切 n-gram（去掉空白）。"""
 
     stripped = "".join(text.split())
     return Counter(stripped[i : i + order] for i in range(len(stripped) - order + 1))
@@ -191,11 +177,10 @@ def corpus_chrf(
 def evaluate_all(
     hypotheses: Sequence[str],
     references: Sequence[str],
-    lang: str = "zh",
 ) -> Dict[str, float]:
     """一次算出训练监控常用的几个数。"""
 
-    bleu = corpus_bleu(hypotheses, references, lang=lang)
+    bleu = corpus_bleu(hypotheses, references)
     return {
         "bleu": bleu.bleu,
         "chrf": corpus_chrf(hypotheses, references),

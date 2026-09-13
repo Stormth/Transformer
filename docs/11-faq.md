@@ -4,27 +4,43 @@
 
 ## 数据与分词
 
-### 中文输出是一串空格分开的字
+### 德语输出被拆成一堆碎片
 
-症状：`我 明 天 去 学 校`。
+症状：`Wirtschaft swachstum`、`Gesch wind igkeit s begrenzung`。
 
-原因：解码时没有把子词拼回词。见 `bpe.py::detokenize` —— 中文汉字之间不能有空格，
-中文标点前也不该有空格。本项目用几个正则统一处理。
+原因有两个，先分清是哪一个：
+
+1. **BPE 没学过这个词**：它会被拆成能认识的最长片段，这是正常的子词行为，
+   不是 bug。看 `python -m nmt.corpus` 打印的词表大小和序列长度就能判断。
+2. **词表太小**：复合词只能靠碎片段拼。改大 `--vocab-size` 再看。
 
 ### 英文输出被拆成 c o mmit tee
 
 缺少**词尾标记**。BPE 把一个词切成了几段，解码时无法判断哪些片段属于同一个词。
 标准做法是训练时给每个词的最后一个字符加 `</w>`（见 `bpe.py::_word_to_symbols`）。
 
+### 输出里出现 `</w>`
+
+正常情况下 `decode()` 会把词尾标记吃掉。如果原样出现在译文里，说明分词器和模型对不上
+（比如换了 `vocab.json` 但用的是旧 checkpoint）—— 重新训一个模型即可。
+
 ### 输出里出现 `<unk>`
 
 模型预测出了词表里的 `<unk>`。可能原因：
 
 * 训练数据里就有太多 `<unk>`（词表太小，或分词器训练数据不够）——
-  跑 `python -m nmt.corpus` 看报告里的 unk 率；
-* 推理时输入的字符没进词表。中文很常见：训练语料里没出现过的生僻字。
+  跑 `python -m nmt.corpus` 看报告；
+* 推理时输入的字符没进词表：德语人名、地名里的特殊字符很常见。
 
-解决方向：调大词表、加数据，或者改用字节级 BPE（byte-level BPE 永远不会 OOV）。
+解决方向：调大词表、加数据。英德这种同字母表的语言对，`<unk>` 率通常很低（千分之几）。
+
+### 变音字母 ä ö ü ß 被当成标点丢掉了
+
+这是 **BLEU 切词**里的坑，不是分词器的：如果评测时用 `[A-Za-z]+` 去切词，
+`für` 会变成 `f` 和 `r`，分数被人为压低。
+
+本项目的 `tokenize_for_bleu` 用 `[^\W\d_]+`（Unicode 字母）匹配，`ä ö ü ß` 都会保留。
+`tests/test_bleu.py::test_tokenize_keeps_umlauts_and_sharp_s` 专门守着这条。
 
 ### 训练 loss 降得很好，推理却一塌糊涂
 
@@ -52,7 +68,7 @@ label      = tgt[:, 1:]      以 <eos> 结尾
 用形状追踪看数据流：
 
 ```bash
-python -m nmt.inspect --checkpoint checkpoints/best.pt --shapes --text "he will finish it tomorrow."
+python -m nmt.inspect --checkpoint checkpoints/best.pt --shapes --text "He will finish the project tomorrow."
 ```
 
 几个高发的形状错误：
@@ -93,8 +109,8 @@ python -m nmt.train --preset small --override train.lr_scale=0.3
 
 按这个顺序调：
 
-1. `--override train.max_tokens=4096`（最有效，直接减少一个 batch 的 token 数）
-2. `--override train.accum_steps=4`（用梯度累积保持等效 batch size）
+1. `--override train.max_tokens=8192`（最有效，直接减少一个 batch 的 token 数）
+2. `--override train.accum_steps=2`（用梯度累积保持等效 batch size）
 3. `--override train.max_src_len=128 --override train.max_tgt_len=128`
 4. `--override model.d_model=256 --override model.d_ff=1024`
 5. 确认 `train.amp=true`（默认已开）
@@ -109,6 +125,9 @@ python -m nmt.train --preset base --save-dir checkpoints --resume auto
 
 `last.pt` 里存了优化器状态、学习率步数、GradScaler 缩放因子、epoch/step 和历史指标，
 续训曲线应该和没中断一样。只存模型权重是接不回去的，曲线会突然变差。
+
+**注意：续训要用和原训练相同的 `--preset`**。因为模型结构是按命令行给的预设建的，
+预设换掉会直接形状不匹配报错。
 
 ### 服务器上要不要设 num_workers
 
@@ -127,8 +146,8 @@ python -m nmt.train --preset base --override train.num_workers=4
 
 ### BLEU 很高但译文读起来不对
 
-说明测试集和训练集太像，或者数据本身是模板生成的。本项目早期用合成语料时，
-验证 BLEU 能到 99.8 —— 那个数字毫无意义。**一定要用真实语料和官方测试集。**
+说明测试集和训练集太像，或者数据本身是模板生成的。本项目早期版本用合成语料时，
+验证 BLEU 能到 99 —— 那个数字毫无意义。**一定要用真实语料和官方测试集。**
 
 ### 译文反复重复同一句
 
@@ -144,25 +163,16 @@ python -m nmt.train --preset base --override train.num_workers=4
 确认 KV cache 生效了。没有 cache 时生成 T 个词的复杂度是 O(T³)，有 cache 是 O(T²)。
 本项目的 `greedy_decode` / `beam_search_decode` 都带 cache。
 
-另外注意 `beam_size=4` 就是 4 倍计算量，做大批量评测时先用 `--beam-size 1` 跑通流程。
+另外注意 `beam_size=4` 大约是 3 倍计算量；评测时还会按输入长度动态限制生成长度
+（见 `inference.translate_dataset` 的 `adaptive_max_len`），
+所以弱模型跑评测不会一路生成到 `max_len`。
 
 ## 环境
 
-### Windows 上中文日志乱码
+### Failed to initialize NumPy: No module named 'numpy'
 
-```powershell
-$env:PYTHONIOENCODING = "utf-8"
-chcp 65001
-```
-
-本项目所有入口脚本都会调 `nmt.utils.setup_console()` 主动把标准输出切成 UTF-8，
-一般不需要手动设置。
-
-### Failed to initialize NumPy: _ARRAY_API not found
-
-NumPy 2.x 和用 NumPy 1.x 编译的 torch 不匹配。本项目**完全不依赖 numpy**
-（分词器、BLEU、可视化全是标准库 + torch 实现），这条警告可以直接无视。
-别的项目需要的话，`pip install "numpy<2"` 即可。
+这条警告可以**直接无视**。本项目完全不依赖 numpy（分词器、BLEU、可视化全是
+标准库 + torch），它会冒出来只是因为 torch 自己想把张量转成 numpy 数组时找不到库。
 
 ### 装了 tensorboard 却没有日志
 
@@ -174,6 +184,16 @@ tensorboard --logdir checkpoints/tensorboard
 ```
 
 不装也没关系 —— `checkpoints/train_log.csv` 里什么都有，Excel 直接能画图。
+
+### 数据准备太慢
+
+BPE 训练是瓶颈（32k 词表大约 1 小时）。三个办法：
+
+```bash
+python -m nmt.corpus --vocab-size 16000        # 合并次数减半，时间大致减半
+python -m nmt.corpus --bpe-train-pairs 50000   # 用更小的子集训分词器
+python -m nmt.corpus --skip-download           # 语料已经下载过就别再下
+```
 
 ## 最后：一个排查思路
 

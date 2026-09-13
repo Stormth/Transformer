@@ -2,14 +2,14 @@
 
 常用命令：
 
-    # 在 dev（newsdev2017）上评测
+    # 在 dev（newstest2013）上评测
     python -m nmt.evaluate --checkpoint checkpoints/best.pt --split dev
 
-    # 在 2019 年官方测试集上评测，并把译文存下来
-    python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2019 --save-pred preds/test2019.txt
+    # 在论文用的那份测试集（newstest2014）上评测，并把译文存下来
+    python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2014 --save-pred preds/test2014.txt
 
     # 对比贪心 vs 不同宽度的束搜索
-    python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2019 --compare-decoders
+    python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2014 --compare-decoders
 
 BLEU 只是"跟参考译文重合了多少 n-gram"，它不理解语义，也不惩罚"读起来不像人话"。
 所以评测时建议同时看 chrF 和长度比，并且一定要把译文打印出来读几段。
@@ -24,14 +24,32 @@ from typing import Dict, List, Sequence, Tuple
 import torch
 
 from .bleu import evaluate_all
+from .corpus import DATA_PAIR
 from .dataset import ParallelTextDataset
 from .inference import Translator, select_eval_indices, translate_dataset
-from .utils import Timer, ensure_dir, get_logger, human_time, read_lines, setup_console, write_lines
+from .utils import (
+    Timer,
+    ensure_dir,
+    get_logger,
+    human_time,
+    load_json,
+    read_lines,
+    setup_console,
+    write_lines,
+)
 
 logger = get_logger()
 
 
 def load_split(data_dir: Path, split: str) -> ParallelTextDataset:
+    meta_path = data_dir / "meta.json"
+    if meta_path.exists():
+        meta = load_json(meta_path)
+        if meta.get("pair") != DATA_PAIR:
+            raise SystemExit(
+                f"{data_dir} 里的数据是 {meta.get('pair')!r} 语言对的，"
+                f"而当前代码需要 {DATA_PAIR!r}。请先跑 python -m nmt.corpus 重新生成数据。"
+            )
     path = data_dir / f"{split}.pt"
     if not path.exists():
         available = sorted(p.stem for p in data_dir.glob("*.pt"))
@@ -55,9 +73,9 @@ def run_once(
             indices=indices, beam_size=beam_size, max_tokens=batch_tokens,
             length_penalty=translator.length_penalty, max_len=translator.max_len,
         )
-    references = read_lines(data_dir / f"{split}.ref.zh")
+    references = read_lines(data_dir / f"{split}.ref.de")
     references = [references[index] for index in indices]
-    metrics = evaluate_all(hypotheses, references, lang="zh")
+    metrics = evaluate_all(hypotheses, references)
     metrics["seconds"] = timer.elapsed
     metrics["sentences"] = float(len(indices))
     metrics["beam_size"] = float(beam_size)
@@ -69,7 +87,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="评测英译中模型")
     parser.add_argument("--checkpoint", default="checkpoints/best.pt")
     parser.add_argument("--data-dir", default="data/ready")
-    parser.add_argument("--split", default="dev", help="dev / test2017 / test2018 / test2019")
+    parser.add_argument(
+        "--split", default="dev",
+        help="dev（newstest2013）/ test2014 / test2017 / test2018 / test2019",
+    )
     parser.add_argument("--beam-size", type=int, default=1)
     parser.add_argument("--length-penalty", type=float, default=0.6)
     parser.add_argument("--max-sentences", type=int, default=0, help="只评这么多句（0=全部）")

@@ -3,13 +3,13 @@
 一层解码器有三个子层（比编码器多一个）：
 
     1. 掩码自注意力 —— 只能看已经写出来的部分（因果掩码）
-    2. 交叉注意力   —— query 来自中文侧，key/value 来自编码器输出的英文 memory
+2. 交叉注意力   —— query 来自德文侧，key/value 来自编码器输出的英文 memory
     3. 前馈网络
 
-"交叉注意力"就是翻译发生的地方：每次要写下一个中文字时，
+"交叉注意力"就是翻译发生的地方：每次要写下一个德语词时，
 它都在问"英文原句里哪几个词跟我现在写的这个字有关"。
 
-增量解码（生成第 t 个字）时不必重算整段中文：
+增量解码（生成第 t 个词）时不必重算整段德文：
 自注意力用 cache_append=True 把新的 K/V 接到历史后面，
 交叉注意力用 cache 把英文的 K/V 存一次反复用。
 """
@@ -59,7 +59,7 @@ class DecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         captured: Dict[str, torch.Tensor] = {}
 
-        # 子层 1：中文侧的自注意力（因果 + padding 掩码）
+        # 子层 1：德文侧的自注意力（因果 + padding 掩码）
         def self_attention(h: torch.Tensor) -> torch.Tensor:
             out, weights = self.self_attn(
                 h, h, h, mask=self_mask, cache=self_cache,

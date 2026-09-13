@@ -4,34 +4,44 @@
 
 ## 为什么不能直接按词切
 
-英文按空格切词看起来很自然，但：
+英语和德语按空格切词看起来很自然，但：
 
-* 词表会爆炸（英语有几十万种词形）；
+* 词表会爆炸（德语的复合词几乎无穷无尽）；
 * 遇到没见过的词（人名、缩写、新词、拼错）只能吐 `<unk>`；
-* 中文根本没有空格。
+* 德语尤其严重：`Wirtschaftswachstum` 这种复合词在真实新闻里到处都是，
+  而它只是 `Wirtschaft` + `Wachstum` 拼起来的。
 
 按字符切又走向另一个极端：序列太长（注意力开销 O(T²)），每个 token 的信息量太小。
 
-**BPE 是折中**：从字符出发，反复把最常一起出现的相邻符号合并。结果是高频词变成一个 token（`the`、`problem`），低频词拆成几个有意义的片段（`unbelievable` → `un` + `believ` + `able`）。
+**BPE 是折中**：从字符出发，反复把最常一起出现的相邻符号合并。结果是：
+
+* 高频词变成一个 token（`the`、`und`）；
+* 复合词被拆成有意义的片段（`Wirtschaftswachstum` → `Wirtschaft` + `swachstum`）；
+* 词尾的语法信息能单独建模（`en</w>`、`ung</w>`、`te</w>`），
+  这对形态丰富的德语特别有用：名词复数、形容词词尾、动词变位都有规律可循。
 
 ## 怎么把句子切成"词"
 
-`pre_tokenize` 按优先级匹配四类东西：
+`pre_tokenize` 按优先级匹配三类东西：
 
 ```
-连续汉字串        他明天在学校讨论这个问题吗
-英文单词（含撇号） don't
-数字（含小数）     3.14
-其它单字符         标点、符号
+字母词（含连字符/撇号）   don't   E-Mail   well-known   nächste
+数字（含小数/千分位）     3.14    1,000
+其它单字符                标点、符号
 ```
 
-为什么中文要整串当一个"词"？因为 BPE 只在**词内部**合并。如果每个汉字都是独立的词，它们之间永远不会被合并，你就得不到"我们""可以"这种高频字组。把连续汉字串当成一个词，BPE 才会在里面学出常见的字组合。
+两个容易写错的地方：
+
+* **连字符和撇号要跟着词走**。`E-Mail` 要是被切成 `E`、`-`、`Mail`，
+  BPE 就会把 `-</w>` 学成一个高频 token，白白浪费词表；德语里这种写法非常多。
+* **变音字母是字母**。`ä ö ü ß` 必须当作普通字母处理（本项目用 `[^\W\d_]`，
+  也就是"Unicode 字母"来匹配），否则 `für` 会被拆成 `f`、`ü`、`r`。
 
 ## BPE 训练算法
 
 ```
 1. 统计所有"词"的出现次数
-2. 把每个词拆成符号序列       committee → c o m m i t t e e</w>
+2. 把每个词拆成符号序列       Wirtschaftswachstum → W i r t ... m</w>
 3. 反复：
      找出当前出现次数最多的相邻符号对 (a, b)
      在所有词里把 a b 合并成 ab
@@ -39,15 +49,20 @@
 4. 直到词表达到目标大小，或者最高频的符号对出现次数低于阈值（min_frequency）
 ```
 
-**最容易忽视的工程点**：每一步只重算"包含这个 pair 的词"，而不是重扫全部语料。本项目用 `pair_counts`（pair → 次数）和 `pair_words`（pair → 包含它的词下标集合）两张表做到这一点。没有这个优化，十几万句语料在纯 Python 里做上万次全量重扫会慢到不可用。
+**最容易忽视的工程点**：每一步只重算"包含这个 pair 的词"，而不是重扫全部语料。
+本项目用 `pair_counts`（pair → 次数）和 `pair_words`（pair → 包含它的词下标集合）两张表做到这一点。
+没有这个优化，几十万句语料在纯 Python 里做几万次全量重扫会慢到不可用。
 
-> 还有一步可以更快：每轮用 `max()` 找最高频 pair 是 O(不同 pair 的数量)，
-> 用堆（heapq + 惰性删除）可以把它降到 O(log n)。本项目的写法更直观，
-> 想练手的话这是个很好的优化题目 —— 先在 `data/ready` 上记录一份基准时间，再改。
+> 这一步是数据准备里最慢的：32k 词表大约要 1 小时（10 万句对的训练子集）。
+> `corpus.py` 会给它配一个带预计剩余时间的进度条。
+> 想快一倍就用 `--vocab-size 16000` —— 合并次数少一半，时间也差不多减半。
+> 想更快，就得换编译好的实现（sentencepiece / HF tokenizers），
+> 代价是失去"每一行都能读懂"这个特性。
 
 ## 词尾标记 `</w>`：为什么必须有它
 
-假设 `committee` 被切成 `c o mmit tee`。解码时如果直接把 token 用空格连起来，就得到 `c o mmit tee` —— 词被拆散了。
+假设 `committee` 被切成 `c o mmit tee`。解码时如果直接把 token 用空格连起来，
+就得到 `c o mmit tee` —— 词被拆散了。
 
 标准做法（BPE 原论文）是给每个词的**最后一个字符**加 `</w>`：
 
@@ -57,25 +72,23 @@
         把它前面攒着的碎片直接连起来，再加一个空格
 ```
 
-中文串不加这个标记 —— 汉字之间本来就不加空格，加了只会让词表多出一倍的汉字形式。
-
 ## 分词器怎么用
 
 ```python
 from nmt.bpe import BPE
 
 tokenizer = BPE.load("data/ready/vocab.json")
-ids = tokenizer.encode("他明天在学校讨论这个问题吗？", add_bos=True, add_eos=True)
-print(ids)                      # [1, 306, 88, 45, 2]
-print(tokenizer.tokenize("committee will decide"))
-print(tokenizer.decode(ids))    # 他明天在学校讨论这个问题吗？
+ids = tokenizer.encode("Der Ingenieur bespricht das Problem.", add_bos=True, add_eos=True)
+print(ids)                       # [1, 306, 88, 45, 2]
+print(tokenizer.tokenize("Wirtschaftswachstum"))   # 看复合词怎么被拆开
+print(tokenizer.decode(ids))     # Der Ingenieur bespricht das Problem.
 ```
 
 ## 批处理：分桶 + 动态 padding
 
 对应代码：`nmt/dataset.py`
 
-句子长度差异极大，如果用一个固定的 batch size：
+句子长度差异很大，如果用一个固定的 batch size：
 
 * 一批里混着长句和短句 → 短句要补到长句的长度，大量算力浪费在 `<pad>` 上；
 * 句子一长就 OOM（注意力是 O(T²)）。
@@ -91,14 +104,27 @@ print(tokenizer.decode(ids))    # 他明天在学校讨论这个问题吗？
 
 ```bash
 # 1. 词表大小实验：小词表序列更长，大词表嵌入参数更多
-python -m nmt.corpus --vocab-size 8000 --skip-download
-#    看打印出来的 "英文 ... token / 中文 ... token" 变化了多少
+python -m nmt.corpus --vocab-size 16000 --skip-download
+#    看打印出来的 "英文 ... token / 德文 ... token" 变化了多少
 
-# 2. 看分词效果（`</w>` 就是词尾标记）
+# 2. 观察复合词是怎么被拆开的
+python -c "
+from nmt.bpe import BPE
+t = BPE.load('data/ready/vocab.json')
+for w in ['Wirtschaftswachstum', 'Geschwindigkeitsbegrenzung', 'Bundeskanzleramt']:
+    print(w, '->', t.tokenize(w))
+"
+
+# 3. 看一次真实翻译的分词（`</w>` 就是词尾标记）
 python -m nmt.translate --checkpoint checkpoints/best.pt --text "..." --show-tokens
 
-# 3. 手工验证解码可逆
-python -c "from nmt.bpe import BPE; t=BPE.load('data/ready/vocab.json'); s='he will finish the project tomorrow.'; print(t.encode(s)); print(t.decode(t.encode(s)))"
+# 4. 手工验证解码可逆
+python -c "
+from nmt.bpe import BPE
+t = BPE.load('data/ready/vocab.json')
+s = 'Der Ingenieur bespricht das Problem morgen in der Schule.'
+print(t.decode(t.encode(s)) == s)
+"
 ```
 
 ## 值得记住的三句话

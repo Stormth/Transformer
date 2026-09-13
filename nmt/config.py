@@ -23,9 +23,9 @@ class ModelConfig:
     """模型结构超参数。"""
 
     # --- 词表 ---
-    src_vocab_size: int = 16000        # 源语言（英文）词表大小
-    tgt_vocab_size: int = 16000        # 目标语言（中文）词表大小
-    share_vocab: bool = True           # 中英共用一个 BPE 词表（本项目默认）
+    src_vocab_size: int = 32000        # 源语言（英文）词表大小
+    tgt_vocab_size: int = 32000        # 目标语言（德文）词表大小
+    share_vocab: bool = True           # 英德共用一个 BPE 词表（本项目默认）
 
     # --- 主体结构 ---
     d_model: int = 512                 # 隐层维度，所有子层输入输出都是它
@@ -211,8 +211,9 @@ def base_config(vocab_size: int = 16000) -> Config:
         train=TrainConfig(
             max_src_len=192,
             max_tgt_len=192,
-            # 动态 batching 的 token 预算。中英句对平均约 110 个 token（含 <bos>/<eos>），
-            # 16384 大约等于 150 句一批；4090 的 24 GB 显存完全放得下。
+            # 动态 batching 的 token 预算。英德句对平均约 60~70 个 token（含 <bos>/<eos>，
+            # 准确数值看 python -m nmt.corpus 打印的统计），16384 大约等于 200 多句一批；
+            # 4090 的 24 GB 显存完全放得下。
             # 如果 OOM：先降到 8192，再用 accum_steps=2 把等效 batch size 补回来。
             max_tokens=16384,
             max_sentences=128,

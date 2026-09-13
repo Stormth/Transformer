@@ -10,7 +10,7 @@
     6. layers.py     残差 + LayerNorm + 前馈网络
     7. embedding.py  词嵌入 + 正弦位置编码
     8. encoder.py    编码器：把英文读成向量
-    9. decoder.py    解码器：一边看英文，一边写中文
+    9. decoder.py    解码器：一边看英文，一边写德文
     10. model.py     组装 + 掩码工具
     11. loss.py      标签平滑交叉熵
     12. scheduler.py Noam 学习率

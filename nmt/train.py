@@ -4,7 +4,7 @@
 
 1. **一个 batch 里到底喂了什么**
        src      [B, S]   英文 id（含 <eos>）
-       tgt      [B, T]   中文 id（含 <bos> 和 <eos>）
+       tgt      [B, T]   德文 id（含 <bos> 和 <eos>）
        decoder 输入 = tgt[:, :-1]，标签 = tgt[:, 1:]
        —— 错开一位，就是"老师强制"（teacher forcing）：每一步都在用正确的前文预测下一个字。
 
@@ -39,7 +39,7 @@ from .bpe import BPE
 from .bleu import evaluate_all
 from .checkpoint import load_checkpoint, move_optimizer_state_to_device, restore_rng, save_checkpoint
 from .config import Config, build_config
-from .corpus import build_dataset
+from .corpus import DATA_PAIR, build_dataset
 from .dataset import ParallelTextDataset, build_dataloader, collate_batch
 from .inference import select_eval_indices, translate_dataset
 from .loss import build_criterion
@@ -85,7 +85,7 @@ def evaluate_on_split(
         model, dataset, tokenizer, device,
         indices=indices, beam_size=beam_size, max_tokens=max_tokens,
     )
-    reference_path = data_dir / f"{split}.ref.zh"
+    reference_path = data_dir / f"{split}.ref.de"
     references = read_lines(reference_path)
     if len(references) != len(dataset):
         raise ValueError(
@@ -93,7 +93,7 @@ def evaluate_on_split(
             "两者应该一一对应（重新跑一次 python -m nmt.corpus 就能修好）"
         )
     references = [references[index] for index in indices]
-    metrics = evaluate_all(hypotheses, references, lang="zh")
+    metrics = evaluate_all(hypotheses, references)
 
     # 顺手把 loss 也算出来：BLEU 只看最终译文的 n-gram，
     # loss 能告诉你"逐位置的预测概率"有没有在改善，两者一起看最稳。
@@ -146,6 +146,23 @@ def train(
         build_dataset(data_dir=data_dir.parent, out_dir=data_dir, vocab_size=model_cfg.src_vocab_size)
 
     tokenizer = BPE.load(data_dir / "vocab.json")
+    # 校验数据是不是英译德的：服务器上很可能残留着上一次英译中的产物，
+    # 那套数据自洽（词表和张量是配套的），不校验的话会静默训出一个中文模型。
+    meta_path = data_dir / "meta.json"
+    if not meta_path.exists():
+        logger.warning(
+            f"{meta_path} 不存在，无法确认数据是不是英德语料。"
+            "如果这份数据是别的语言对留下的，请先跑 python -m nmt.corpus"
+        )
+    else:
+        meta = load_json(meta_path)
+        if meta.get("pair") != DATA_PAIR:
+            raise SystemExit(
+                f"{data_dir} 里的数据是 {meta.get('pair')!r} 语言对的，"
+                f"而当前代码需要 {DATA_PAIR!r}。\n"
+                "请先重新生成数据：python -m nmt.corpus\n"
+                "（旧产物可以直接删掉：data/ready 和 data/raw 下的非 *.de-en 目录）"
+            )
     # 词表大小必须和模型一致；这里以实际训出来的词表为准，而不是预设里的数字
     model_cfg.src_vocab_size = len(tokenizer)
     model_cfg.tgt_vocab_size = len(tokenizer)

@@ -25,10 +25,10 @@ class Transformer(nn.Module):
     前向流程（训练时一次算完整句）：
 
         英文 id [B,S] --词嵌入+位置--> [B,S,d] --编码器--> memory [B,S,d]
-        中文 id [B,T] --词嵌入+位置--> [B,T,d] --解码器(看 memory)--> [B,T,d]
-                                                          --输出层--> logits [B,T,V]
+        德文 id [B,T] --词嵌入+位置--> [B,T,d] --解码器(看 memory)--> [B,T,d]
+                                                         --输出层--> logits [B,T,V]
 
-    之后用 logits 和"右移一位的中文"算交叉熵 —— 每个位置都在预测下一个字。
+    之后用 logits 和"右移一位的德文"算交叉熵 —— 每个位置都在预测下一个词。
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -40,7 +40,7 @@ class Transformer(nn.Module):
             config.src_vocab_size, config.d_model, config.scale_embedding
         )
         if config.share_vocab and config.src_vocab_size == config.tgt_vocab_size:
-            # 中英共用一个词表时，直接复用同一个模块 -> 参数也共享
+            # 英德共用一个词表时，直接复用同一个模块 -> 参数也共享
             self.tgt_embedding = self.src_embedding
         else:
             self.tgt_embedding = TokenEmbedding(
@@ -148,7 +148,7 @@ class Transformer(nn.Module):
         return_weights: bool = False,
         position_offset: int = 0,
     ) -> Tuple[torch.Tensor, Optional[list]]:
-        """中文 id [B,T] + memory -> 隐状态 [B,T,d_model]
+        """德文 id [B,T] + memory -> 隐状态 [B,T,d_model]
 
         position_offset：增量解码时告诉位置编码"这一小段从第几个位置开始"。
         """
@@ -192,7 +192,7 @@ class Transformer(nn.Module):
             return sum(p.numel() for p in module.parameters())
 
         total = count_parameters(self)
-        shared_note = "（中英共享同一张词嵌入表）" if self.config.share_vocab else ""
+        shared_note = "（英德共享同一张词嵌入表）" if self.config.share_vocab else ""
         lines = [
             "模型结构摘要",
             f"  d_model={self.config.d_model}  n_heads={self.config.n_heads}  "

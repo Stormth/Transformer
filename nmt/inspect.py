@@ -8,7 +8,7 @@
 
 2. **注意力热力图**：把"哪个位置在看哪个位置"画出来。
    编码器自注意力能看到模型把哪些词圈在一起，
-   解码器交叉注意力能看到"写这个中文字时在看英文的哪个词" —— 翻译对齐关系一目了然。
+   解码器交叉注意力能看到"写这个德语词时在看英文的哪个词" —— 翻译对齐关系一目了然。
 
 输出：
     * 终端里的字符热力图（点号到 @ 的深浅）
@@ -89,7 +89,7 @@ def trace_shapes(
 
     lines = [
         f"输入：{source!r} -> {len(src_ids)} 个 token（含 <eos>）",
-        f"      {tgt_ids}  <- 中文 {len(tgt_ids)} 个 token（<bos> ... <eos>）",
+        f"      {tgt_ids}  <- 德文 {len(tgt_ids)} 个 token（<bos> ... <eos>）",
         "",
         f"{'模块':<46}{'输入形状':<28}{'输出形状'}",
         "-" * 104,
@@ -217,8 +217,8 @@ def html_report(data: Dict[str, object], output: Path) -> None:
             parts.append(f"<b style='font-size:12px'>head {head}</b>")
             parts.append(grid(weights[head], src_tokens))
 
-    parts.append("<h2>解码器交叉注意力（写中文时看英文的哪里）</h2>")
-    parts.append("<p>这就是翻译对齐关系的可视化：写第几个中文字时，注意力落在英文的哪些词上。</p>")
+    parts.append("<h2>解码器交叉注意力（写德文时看英文的哪里）</h2>")
+    parts.append("<p>这就是翻译对齐关系的可视化：写第几个德语词时，注意力落在英文的哪些词上。</p>")
     for layer, weights in enumerate(data["decoder_cross"]):  # type: ignore[arg-type]
         parts.append(f"<h3>第 {layer + 1} 层</h3>")
         for head in range(weights.shape[0]):
@@ -262,7 +262,7 @@ def main() -> None:
 
     logger.info(f"编码器自注意力（第 {layer + 1} 层，head {head}）")
     print(ascii_heatmap(data["encoder_self"][layer][head], list(data["src_tokens"]), list(data["src_tokens"])))  # type: ignore[index,arg-type]
-    logger.info(f"解码器交叉注意力（第 {layer + 1} 层，head {head}）：写中文时看英文的哪里")
+    logger.info(f"解码器交叉注意力（第 {layer + 1} 层，head {head}）：写德文时看英文的哪里")
     print(ascii_heatmap(data["decoder_cross"][layer][head], list(data["tgt_tokens"]), list(data["src_tokens"])))  # type: ignore[index,arg-type]
 
     if args.html:

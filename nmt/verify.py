@@ -274,7 +274,7 @@ def verify(
     )
     logger.info(
         f"输入：英文 [B={batch}, S={src_len}]（其中 {int(src_pad.sum())} 个 <pad>）"
-        f"，中文 [B={batch}, T={tgt_len}]（{int(tgt_pad.sum())} 个 <pad>）"
+        f"，德文 [B={batch}, T={tgt_len}]（{int(tgt_pad.sum())} 个 <pad>）"
     )
     logger.info("-" * 74)
     logger.info(f"编码器输出最大差异（只看有效位置）  {results['encoder']:.3e}")

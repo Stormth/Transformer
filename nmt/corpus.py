@@ -1,22 +1,31 @@
 """真实平行语料的下载、清洗、切分和编码。
 
-本项目用两份公开语料：
+本项目用两份公开语料（英译德）：
 
-    News-Commentary v16 (en-zh)  ~12.6 万句对   训练集。新闻评论域，也就是"新闻联播"体
-    WMT-News v2019 (en-zh)       ~2 万句对      WMT 官方 newsdev/newstest，做验证与测试
+    News-Commentary v16 (de-en)  ~29.4 万句对  训练集，新闻评论域
+    WMT-News v2019 (de-en)       ~4.6 万句对    WMT 官方历年测试集
 
-为什么测试集要用 WMT 官方的那几个？
+具体切成四份：
 
-因为它们就是每年机器翻译评测用的标准测试集。你在自己的模型上跑出来的 BLEU，
-可以直接和论文、商业系统、开源模型的公开分数摆在一起比。
-如果自己随便切一个测试集，分数再高也不知道好不好。
+    dev      newstest2013          3000 句    WMT14 英德任务的标准验证集
+    test2014 newstest2014          3003 句    论文里报 27.3 BLEU 用的就是它
+    test2017 newstest2017-ende     3004 句
+    test2018 newstest2018-ende     2998 句
+    test2019 newstest2019-ende     1997 句
+
+为什么测试集必须是官方的？
+
+因为 BLEU 只在同一份测试集、同一套切词方式下才有可比性。WMT 的 newstest2014
+是《Attention Is All You Need》报分数用的那份，也是后来几乎所有 NMT 论文的标配，
+你自己的模型跑出来的数字可以直接和它们摆在一起看。自己随手切一个测试集，
+分数再高也不知道算高还是低。
 
 真实数据是脏的，这个文件里有相当一部分代码在处理这些事：
 
     * 空行（原文件里段落之间有空行）
     * 编码坏行（UTF-8 解码失败留下的 U+FFFD）
-    * 语言放错（中文那一列其实是英文）
-    * 长度比例失衡（一句英文对着一大段中文，通常是文档级对齐的错位）
+    * 语言放错（德语那一列其实是英语，或者混进了别的语言）
+    * 长度比例失衡（一句英文对着一大段德语，通常是文档级对齐的错位）
     * 重复句对
 
 每一步过滤都会记数并打印出来 —— 数据清洗最忌讳"悄悄扔掉了几十万句"。
@@ -26,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import time
 import urllib.request
 import zipfile
 from collections import Counter
@@ -36,10 +46,15 @@ from xml.etree import ElementTree
 
 import torch
 
-from .bpe import BPE, cjk_ratio, normalize_text
-from .utils import Timer, ensure_dir, get_logger, save_json, set_seed
+from .bpe import BPE, contains_cjk, normalize_text
+from .utils import Timer, ensure_dir, get_logger, human_time, save_json, set_seed
 
 logger = get_logger()
+
+# 这一份代码只做英译德。把语言对写进 meta.json，
+# 训练脚本启动时会校验 —— 否则你在服务器上很可能拿着上一次英译中留下的
+# data/ready 直接开训，发现得晚了就白跑几小时。
+DATA_PAIR = "en-de"
 
 
 # --------------------------------------------------------------------------
@@ -56,46 +71,57 @@ class CorpusSpec:
     default_max_pairs: int = 0  # 0 = 全部使用
 
 
-# 训练语料：新闻评论域，中英各约 12.6 万句
+# 训练语料：新闻评论域，英德约 29.4 万句对（是常见语言对里质量最好的中等规模语料之一）
+# 注意名字里带上 de-en：缓存目录按语料名区分，换语言对时不会误用上一次的缓存
 NEWS_COMMENTARY = CorpusSpec(
-    name="News-Commentary",
-    url="https://object.pouta.csc.fi/OPUS-News-Commentary/v16/moses/en-zh.txt.zip",
+    name="News-Commentary.de-en",
+    url="https://object.pouta.csc.fi/OPUS-News-Commentary/v16/moses/de-en.txt.zip",
     domain="新闻评论",
-    note="WMT 官方指定的训练语料之一",
+    note="WMT 官方指定的训练语料之一，294,498 句对",
 )
 
-# 验证 / 测试语料：WMT 历年 newsdev 与 newstest
+# 验证 / 测试语料：WMT 历年 newstest（2008~2019 全都在这一个包里）
 WMT_NEWS = CorpusSpec(
-    name="WMT-News",
-    url="https://object.pouta.csc.fi/OPUS-WMT-News/v2019/moses/en-zh.txt.zip",
+    name="WMT-News.de-en",
+    url="https://object.pouta.csc.fi/OPUS-WMT-News/v2019/moses/de-en.txt.zip",
     domain="新闻",
-    note="newsdev2017 + newstest2017/2018/2019，含官方参考译文",
+    note="newstest2013（dev）+ newstest2014/2017/2018/2019（测试），含官方参考译文",
 )
 
 # 可选加餐：换领域做数据规模实验
 EXTRA_CORPORA: Dict[str, CorpusSpec] = {
-    "ted2013": CorpusSpec(
-        name="TED2013",
-        url="https://object.pouta.csc.fi/OPUS-TED2013/v1.1/moses/en-zh.txt.zip",
-        domain="演讲口语",
-        note="句子短、口语化，用来观察换领域后 BLEU 怎么变",
-        default_max_pairs=150000,
+    "europarl": CorpusSpec(
+        name="Europarl.de-en",
+        url="https://object.pouta.csc.fi/OPUS-Europarl/v8/moses/de-en.txt.zip",
+        domain="欧洲议会辩论",
+        note="近 200 万句对，是英德方向上最大的干净语料；语气正式、句式长",
+        default_max_pairs=300000,
     ),
-    "un": CorpusSpec(
-        name="UN",
-        url="https://object.pouta.csc.fi/OPUS-UN/v20090831/moses/en-zh.txt.zip",
+    "ted2013": CorpusSpec(
+        name="TED2013.de-en",
+        url="https://object.pouta.csc.fi/OPUS-TED2013/v1.1/moses/de-en.txt.zip",
+        domain="演讲口语",
+        note="14 万句对，句子短、口语化，用来观察换领域后 BLEU 怎么变",
+        default_max_pairs=140000,
+    ),
+    "multiun": CorpusSpec(
+        name="MultiUN.de-en",
+        url="https://object.pouta.csc.fi/OPUS-MultiUN/v1/moses/de-en.txt.zip",
         domain="联合国文件",
-        note="正式书面语，语气接近新闻稿",
-        default_max_pairs=70000,
+        note="16 万句对，正式书面语，术语密集",
+        default_max_pairs=160000,
     ),
 }
 
-# WMT-News 里 4 个官方数据集的文档名 -> 我们给它的 split 名
+# WMT-News 里官方数据集的文档名 -> 我们给它的 split 名
+# 注意 OPUS 的命名规则：后缀是"对齐时的源语言"。同一个年份的 -deen 和 -ende
+# 是两套不同的句对，这里统一取 -ende（英译德方向），2013/2014 只有一套就直接用。
 WMT_SPLITS = {
-    "newsdev2017-enzh": "dev",
-    "newstest2017-enzh": "test2017",
-    "newstest2018-enzh": "test2018",
-    "newstest2019-enzh": "test2019",
+    "newstest2013": "dev",
+    "newstest2014-deen": "test2014",
+    "newstest2017-ende": "test2017",
+    "newstest2018-ende": "test2018",
+    "newstest2019-ende": "test2019",
 }
 
 
@@ -140,7 +166,7 @@ def extract(zip_path: Path, dest_dir: Path, force: bool = False) -> Path:
     """解压 OPUS 的 moses 格式包。
 
     解压出来通常有三样东西：
-        *.en / *.zh   每行一句的平行文本
+        *.en / *.de   每行一句的平行文本
         *.xml         句子级对齐表（能看出哪些句子属于哪个文档）
         LICENSE/README
     """
@@ -171,13 +197,17 @@ def fetch_corpus(spec: CorpusSpec, raw_dir: Path, force: bool = False) -> Path:
 # 读取
 # --------------------------------------------------------------------------
 def read_moses_pairs(directory: Path) -> List[Tuple[str, str]]:
-    """读 moses 格式的 .en / .zh 两个文件，按行配成句对。"""
+    """读 moses 格式的 .en / .de 两个文件，按行配成句对。
+
+    返回 (英文, 德文) —— 也就是英译德方向。
+    注意 OPUS 的包名是 de-en，但文件是分开的，方向由我们读的顺序决定。
+    """
 
     directory = Path(directory)
     en_files = list(directory.glob("*.en"))
-    zh_files = list(directory.glob("*.zh"))
-    if not en_files or not zh_files:
-        raise FileNotFoundError(f"{directory} 里没有找到 *.en / *.zh 文件")
+    de_files = list(directory.glob("*.de"))
+    if not en_files or not de_files:
+        raise FileNotFoundError(f"{directory} 里没有找到 *.en / *.de 文件")
 
     # errors="replace" 会把坏字节换成 U+FFFD 而不是直接抛异常，
     # 这样我们能"看得见"坏行，并在清洗阶段把它们挑出来。
@@ -185,10 +215,10 @@ def read_moses_pairs(directory: Path) -> List[Tuple[str, str]]:
         return path.read_text(encoding="utf-8", errors="replace").splitlines()
 
     source = read_lines(en_files[0])
-    target = read_lines(zh_files[0])
+    target = read_lines(de_files[0])
     if len(source) != len(target):
         raise ValueError(
-            f"两个文件行数不一致：{en_files[0].name}={len(source)}，{zh_files[0].name}={len(target)}"
+            f"两个文件行数不一致：{en_files[0].name}={len(source)}，{de_files[0].name}={len(target)}"
         )
     return list(zip(source, target))
 
@@ -196,12 +226,12 @@ def read_moses_pairs(directory: Path) -> List[Tuple[str, str]]:
 def read_wmt_news_splits(directory: Path) -> Dict[str, List[Tuple[str, str]]]:
     """从 WMT-News 里切出官方的 dev / test 集。
 
-    做法：xml 里的每个 <linkGrp> 对应一个文档（newsdev2017-enzh 之类），
-    它们的先后顺序和 .en/.zh 文件的行顺序一致。按 linkGrp 的条数累加偏移量，
+    做法：xml 里的每个 <linkGrp> 对应一个文档（newstest2014-deen 之类），
+    它们的先后顺序和 .en/.de 文件的行顺序一致。按 linkGrp 的条数累加偏移量，
     就能把整块行区间还原成一个个测试集。
 
-    这里只取 "-enzh" 方向的文档；包里还有一份 "-zhen"，是同样的句子反过来，
-    混进来会让测试集凭空翻倍。
+    这个包里同时有 -deen 和 -ende 两种文档：它们是**两套不同的句对**
+    （源语不同、译文不同），混在一起会把测试集撑大。这里只取 WMT_SPLITS 里列出的那几个。
     """
 
     directory = Path(directory)
@@ -235,17 +265,33 @@ def read_wmt_news_splits(directory: Path) -> Dict[str, List[Tuple[str, str]]]:
 # --------------------------------------------------------------------------
 # 清洗
 # --------------------------------------------------------------------------
+# 判断"语言放错"用的功能词表。
+# 英德同属拉丁字母，光看字符集分不出谁是谁，只能靠最高频的功能词 ——
+# 这也是真实数据清洗里常用的土办法（正式项目会用 fastText 之类的语言识别模型）。
+_ENGLISH_MARKERS = {
+    "the", "and", "of", "to", "in", "is", "was", "were", "for", "that", "with",
+    "on", "as", "by", "at", "from", "it", "be", "has", "have", "this", "not",
+}
+_GERMAN_MARKERS = {
+    "der", "die", "das", "und", "ist", "sind", "nicht", "mit", "sich", "auf",
+    "für", "von", "den", "dem", "ein", "eine", "zu", "im", "am", "des", "wird",
+    "auch", "als", "dass", "hat", "haben",
+}
+
+_LATIN = re.compile(r"[A-Za-zÀ-ÖØ-öø-ɏ]")
+_WORD_SPLIT = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
 @dataclass
 class CleanConfig:
     """清洗阈值。改这些数字前先看一眼被丢掉的原因分布。"""
 
-    max_chars: int = 400             # 单侧字符数上限（编码后还会再按 token 数过滤）
+    max_chars: int = 400              # 单侧字符数上限（编码后还会再按 token 数过滤）
     min_chars: int = 1
-    min_cjk_ratio: float = 0.25      # 中文那一列至少要有这么多汉字
-    max_src_cjk_ratio: float = 0.20  # 英文那一列不该有多少汉字
-    min_latin_ratio: float = 0.40    # 英文那一列至少要有这么多拉丁字母
-    min_length_ratio: float = 0.20   # 中文/英文字符数比例的下限
-    max_length_ratio: float = 2.50   # 上限
+    min_latin_ratio: float = 0.50     # 两侧都必须以拉丁字母为主，能筛掉混进来的俄语/希腊语
+    min_length_ratio: float = 0.50    # 德文字符数 / 英文字符数
+    max_length_ratio: float = 2.50    # 上限
+    check_language: bool = True       # 用功能词粗判"哪一侧其实是另一种语言"
 
 
 @dataclass
@@ -269,11 +315,24 @@ class CleanStats:
 
 
 def _latin_ratio(text: str) -> float:
+    """去掉空白后，拉丁字母占的比例。"""
+
     stripped = "".join(text.split())
     if not stripped:
         return 0.0
-    latin = sum(1 for ch in stripped if ch.isascii() and ch.isalpha())
-    return latin / len(stripped)
+    return len(_LATIN.findall(stripped)) / len(stripped)
+
+
+def _words(text: str) -> List[str]:
+    return _WORD_SPLIT.findall(text.lower())
+
+
+def _looks_english(text: str) -> bool:
+    return any(word in _ENGLISH_MARKERS for word in _words(text))
+
+
+def _looks_german(text: str) -> bool:
+    return any(word in _GERMAN_MARKERS for word in _words(text))
 
 
 def clean_pair(
@@ -282,7 +341,10 @@ def clean_pair(
     stats: CleanStats,
     config: CleanConfig,
 ) -> Optional[Tuple[str, str]]:
-    """清洗一句句对。返回 None 表示丢弃，并会在 stats 里记下原因。"""
+    """清洗一句句对。返回 None 表示丢弃，并会在 stats 里记下原因。
+
+    source 是英文，target 是德文。
+    """
 
     stats.seen += 1
     source = normalize_text(source)
@@ -290,6 +352,10 @@ def clean_pair(
 
     if "\ufffd" in source or "\ufffd" in target:
         stats.drop("编码坏行（含替换字符 U+FFFD）")
+        return None
+    if contains_cjk(source) or contains_cjk(target):
+        # 英德语料里出现汉字，基本只有一种可能：抓取串行或者编码坏了
+        stats.drop("混入汉字/日文（疑似抓取或编码问题）")
         return None
     if not source or not target:
         stats.drop("空行")
@@ -301,21 +367,30 @@ def clean_pair(
         stats.drop("太短")
         return None
 
-    if cjk_ratio(target) < config.min_cjk_ratio:
-        stats.drop("中文侧汉字比例过低（可能语言放错）")
-        return None
-    if cjk_ratio(source) > config.max_src_cjk_ratio:
-        stats.drop("英文侧混入大量汉字")
-        return None
     if _latin_ratio(source) < config.min_latin_ratio:
-        stats.drop("英文侧拉丁字母比例过低")
+        stats.drop("英文侧拉丁字母比例过低（可能混了别的语言）")
+        return None
+    if _latin_ratio(target) < config.min_latin_ratio:
+        stats.drop("德文侧拉丁字母比例过低（可能混了别的语言）")
         return None
 
-    # 长度比例：中文译文的字符数一般是英文的 0.3~0.8 倍。
-    # 偏离太远通常意味着对齐错位（一句英文对着一整段中文）。
+    # 功能词判语言：只在两边都够长、而且证据明确时才丢。
+    # 为什么要加"两边都够长"？因为新闻标题常常一个功能词都没有
+    # （"New Questions Over California Water Project"），不能因此误杀。
+    if config.check_language:
+        if len(_words(source)) >= 6 and len(_words(target)) >= 6:
+            if _looks_english(target) and not _looks_german(target):
+                stats.drop("德文侧其实是英文（对齐错位）")
+                return None
+            if _looks_german(source) and not _looks_english(source):
+                stats.drop("英文侧其实是德文（对齐错位）")
+                return None
+
+    # 长度比例：德语通常比英语长 0~20%（复合词和格变化会多出一些字母）。
+    # 偏离太远通常意味着对齐错位（一句英文对着一整段德语）。
     length_ratio = len(target) / max(1, len(source))
     if not config.min_length_ratio <= length_ratio <= config.max_length_ratio:
-        stats.drop("中英长度比例失衡（疑似对齐错位）")
+        stats.drop("德英长度比例失衡（疑似对齐错位）")
         return None
 
     stats.kept += 1
@@ -366,7 +441,7 @@ def encode_split(
 
     约定：
         src: 英文 id + <eos>，不加 <bos>
-        tgt: <bos> + 中文 id + <eos>
+        tgt: <bos> + 德文 id + <eos>
     训练时把 tgt 错开一位：输入 tgt[:, :-1]，标签 tgt[:, 1:]。
 
     返回值里最后一项是"过滤后保留下来的句对原文"：
@@ -429,13 +504,13 @@ def save_split(
         },
         path,
     )
-    # 同时存一份纯文本：评测 BLEU 时用得上，也能直接打开 human eye 检查数据
+    # 同时存一份纯文本：评测 BLEU 时用得上，也能直接用眼睛扫一遍数据
     if kept_pairs:
         path = Path(path)
         (path.parent / f"{path.stem}.src.en").write_text(
             "\n".join(source for source, _ in kept_pairs) + "\n", encoding="utf-8"
         )
-        (path.parent / f"{path.stem}.ref.zh").write_text(
+        (path.parent / f"{path.stem}.ref.de").write_text(
             "\n".join(target for _, target in kept_pairs) + "\n", encoding="utf-8"
         )
 
@@ -446,13 +521,13 @@ def save_split(
 def build_dataset(
     data_dir: str | Path = "data",
     out_dir: str | Path = "data/ready",
-    vocab_size: int = 16000,
+    vocab_size: int = 32000,
     max_src_len: int = 192,
     max_tgt_len: int = 192,
     extras: Sequence[str] = (),
     extra_pairs: int = 0,
     max_train_pairs: int = 0,
-    bpe_train_lines: int = 200000,
+    bpe_train_pairs: int = 100000,
     skip_download: bool = False,
     seed: int = 2024,
 ) -> Dict[str, object]:
@@ -464,7 +539,12 @@ def build_dataset(
     raw_dir = ensure_dir(data_dir / "raw")
 
     clean_config = CleanConfig()
-    meta: Dict[str, object] = {"vocab_size": vocab_size, "sources": {}}
+    meta: Dict[str, object] = {
+        "pair": DATA_PAIR,
+        "format_version": 2,
+        "vocab_size": vocab_size,
+        "sources": {},
+    }
 
     # --- 1. 训练语料 ---
     logger.info("=" * 68)
@@ -527,15 +607,31 @@ def build_dataset(
     logger.info("=" * 68)
     logger.info(f"第 3 步：训练 BPE 分词器（目标词表 {vocab_size}）")
     bpe_texts: List[str] = []
-    for source, target in train_pairs[:bpe_train_lines]:
+    # 只拿前 N 句对训分词器：合并规则学的是"词怎么拼"，10 万句对已经足够，
+    # 再往上加只会让这一步更慢（每多一个词，所有涉及它的合并都要多算一次）。
+    for source, target in train_pairs[:bpe_train_pairs]:
         bpe_texts.append(source)
         bpe_texts.append(target)
+
+    # BPE 训练是数据准备里最慢的一步，所以给它配一个带预计剩余时间的进度条。
+    # 速率按"已完成合并数 / 已用秒数"实时估算，前几十秒的估算会偏乐观，属正常现象。
+    merge_start = time.perf_counter()
+
+    def _merge_progress(done: int, total: int) -> None:
+        elapsed = time.perf_counter() - merge_start
+        rate = done / max(1e-9, elapsed)
+        remaining = (total - done) / max(1e-9, rate)
+        logger.info(
+            f"    BPE 合并 {done}/{total}（已用 {human_time(elapsed)}，"
+            f"预计还需 {human_time(remaining)}）"
+        )
+
     with Timer() as timer:
         tokenizer = BPE.train(
             bpe_texts,
             vocab_size=vocab_size,
             min_frequency=2,
-            progress=lambda done, total: logger.info(f"    BPE 合并进度 {done}/{total}"),
+            progress=_merge_progress,
         )
     logger.info(f"{tokenizer.summary()}（耗时 {timer.elapsed:.1f}s）")
     tokenizer.save(out_dir / "vocab.json")
@@ -552,7 +648,7 @@ def build_dataset(
         split_stats[name] = stats
         logger.info(
             f"{name:<9} {stats['pairs']:>7} 句  英文 {stats['src_tokens']:>10} token  "
-            f"中文 {stats['tgt_tokens']:>9} token  "
+            f"德文 {stats['tgt_tokens']:>9} token  "
             f"（英文均长 {stats['src_len_mean']:.1f}，p95 {stats['src_len_p95']:.0f}）"
         )
 
@@ -580,9 +676,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="下载并准备英译中新闻平行语料")
     parser.add_argument("--data-dir", default="data", help="原始语料存放目录")
     parser.add_argument("--out", default="data/ready", help="处理后产物目录")
-    parser.add_argument("--vocab-size", type=int, default=16000)
+    parser.add_argument(
+        "--vocab-size", type=int, default=32000,
+        help="联合 BPE 词表大小。英德这种形态丰富的语言对用 32k 比较标准；"
+             "想快一倍可以降到 16000（BPE 训练时间大致与合并次数成正比）",
+    )
     parser.add_argument("--max-src-len", type=int, default=192, help="英文侧最大 token 数")
-    parser.add_argument("--max-tgt-len", type=int, default=192, help="中文侧最大 token 数")
+    parser.add_argument("--max-tgt-len", type=int, default=192, help="德文侧最大 token 数")
     parser.add_argument(
         "--extra",
         action="append",
@@ -592,7 +692,11 @@ def main() -> None:
     )
     parser.add_argument("--extra-pairs", type=int, default=0, help="额外语料最多取多少句，0=用默认值")
     parser.add_argument("--max-train-pairs", type=int, default=0, help="训练集上限，0=不限制")
-    parser.add_argument("--bpe-train-lines", type=int, default=200000, help="训练 BPE 时最多看多少句")
+    parser.add_argument(
+        "--bpe-train-pairs", type=int, default=100000,
+        help="训练 BPE 时最多用多少句对（默认 10 万，约等于 20 万行文本）。"
+             "词表 32k 时这一步大约要 1 小时，想快点可以配合 --vocab-size 16000",
+    )
     parser.add_argument("--skip-download", action="store_true", help="跳过下载，直接用已解压的目录")
     parser.add_argument("--seed", type=int, default=2024)
     args = parser.parse_args()
@@ -606,7 +710,7 @@ def main() -> None:
         extras=args.extra,
         extra_pairs=args.extra_pairs,
         max_train_pairs=args.max_train_pairs,
-        bpe_train_lines=args.bpe_train_lines,
+        bpe_train_pairs=args.bpe_train_pairs,
         skip_download=args.skip_download,
         seed=args.seed,
     )

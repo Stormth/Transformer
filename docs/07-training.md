@@ -6,7 +6,7 @@
 
 ```
 src             [B, S]     英文 id，以 <eos> 结尾
-tgt             [B, T]     中文 id，以 <bos> 开头、<eos> 结尾
+tgt             [B, T]     德文 id，以 <bos> 开头、<eos> 结尾
 decoder 输入    tgt[:, :-1]     <bos> 我 明天 去 学校
 labels          tgt[:, 1:]      我 明天 去 学校 <eos>
 ```
@@ -111,7 +111,7 @@ nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
 每个 epoch 结束后：
 
-1. 在 dev（newsdev2017）上解码一批句子（默认 400 句，贪心解码，快）；
+1. 在 dev（newstest2013）上解码一批句子（默认 400 句，贪心解码，快）；
 2. 算 BLEU / chrF / 长度比，写进 `train_log.csv`；
 3. 保存 `last.pt`；BLEU 超过历史最优时同时保存 `best.pt`。
 

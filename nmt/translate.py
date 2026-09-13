@@ -5,7 +5,7 @@
 
     # 翻多句 / 翻一个文件
     python -m nmt.translate --checkpoint checkpoints/best.pt --text "..." --text "..."
-    python -m nmt.translate --checkpoint checkpoints/best.pt --file testsets/news.en --out news.zh
+    python -m nmt.translate --checkpoint checkpoints/best.pt --file news.en --out news.de
 
     # 交互模式：不带 --text/--file，直接从键盘输入，一行一句
     python -m nmt.translate --checkpoint checkpoints/best.pt
@@ -100,7 +100,7 @@ def main() -> None:
             print(target)
         else:
             print(f"  英文  {source}")
-            print(f"  中文  {target}")
+            print(f"  德文  {target}")
             print()
 
 

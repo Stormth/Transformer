@@ -23,7 +23,7 @@ import torch
 def setup_console() -> None:
     """把标准输出切成 UTF-8。
 
-    Windows 控制台默认是 GBK，打印中文日志时可能乱码甚至直接抛
+    Windows 控制台默认是 GBK，打印中文/德语等非 ASCII 日志时可能乱码甚至直接抛
     UnicodeEncodeError。所有入口脚本第一件事就调用它。
     """
 

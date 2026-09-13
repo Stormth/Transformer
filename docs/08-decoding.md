@@ -25,7 +25,7 @@
 
 每步都选概率最大的词。快，但**一步选错就再也回不来**。
 
-典型症状："他明天去学校" 被翻成 "He goes to school tomorrow" 这类句子时，
+典型症状：德语的动词位置很讲究（从句里要跑到句尾），
 贪心可能在第一个词就选了个不合适的开头，后面只能硬接。
 
 ### 束搜索（beam search）
@@ -36,7 +36,7 @@
 而且 K 太大反而会让译文变得"平庸"（更长的句子被系统性偏好），幻觉也更多。
 
 ```bash
-python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2019 --compare-decoders
+python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2014 --compare-decoders
 ```
 
 ## 两个必须处理的细节
@@ -119,7 +119,7 @@ python -m nmt.translate --checkpoint checkpoints/best.pt --text "The meeting was
 python -m nmt.translate --checkpoint checkpoints/best.pt --beam-size 4 --text "..."
 
 # 批量翻译一个文件
-python -m nmt.translate --checkpoint checkpoints/best.pt --file news.en --out news.zh --beam-size 4
+python -m nmt.translate --checkpoint checkpoints/best.pt --file news.en --out news.de --beam-size 4
 
 # 交互模式（不带 --text/--file，逐行输入）
 python -m nmt.translate --checkpoint checkpoints/best.pt
@@ -132,11 +132,11 @@ python -m nmt.translate --checkpoint checkpoints/best.pt --text "..." --show-tok
 
 ```bash
 # 1. 对比不同束宽（这一条命令把 1/2/4/8 全跑一遍）
-python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2019 --compare-decoders
+python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2014 --compare-decoders
 
 # 2. 看长度惩罚的影响
-python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2019 --beam-size 4 --length-penalty 0.0
-python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2019 --beam-size 4 --length-penalty 1.2
+python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2014 --beam-size 4 --length-penalty 0.0
+python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2014 --beam-size 4 --length-penalty 1.2
 
 # 3. 把 min_len 设成 5，看译文开头会不会更稳
 #    改 nmt/decoding.py 里 greedy_decode / beam_search_decode 的 min_len 默认值

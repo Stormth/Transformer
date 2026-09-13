@@ -57,7 +57,7 @@ class ParallelTextDataset(Dataset):
         return self.src[src_start:src_end].long(), self.tgt[tgt_start:tgt_end].long()
 
     def length(self, index: int) -> Tuple[int, int]:
-        """句子的 (英文长度, 中文长度)，分桶时用。"""
+        """句子的 (英文长度, 德文长度)，分桶时用。"""
 
         return int(self.src_lengths[index]), int(self.tgt_lengths[index])
 
@@ -183,7 +183,7 @@ def collate_batch(
 
     返回：
         src          [B, S]  英文 id（含 <eos>）
-        tgt          [B, T]  中文 id（含 <bos> 与 <eos>）
+        tgt          [B, T]  德文 id（含 <bos> 与 <eos>）
         src_lengths  [B]
         tgt_lengths  [B]
     """
