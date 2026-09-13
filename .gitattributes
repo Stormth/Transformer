@@ -1,0 +1,11 @@
+# 统一换行符：仓库内一律使用 LF，避免 Windows/Linux 协作时整个文件被标记为"已修改"
+* text=auto eol=lf
+
+# 二进制文件不做换行符转换
+*.pt binary
+*.png binary
+*.jpg binary
+
+# 语言统计
+*.py text
+*.md text

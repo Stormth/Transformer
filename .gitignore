@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 训练产物（可用 python -m src.build_data / python -m src.train 重新生成）
+data/processed/
+data/processed_*/
+checkpoints/
+checkpoints_*/
+attention_report.html
+train_console.txt
+*.log
+
+# 编辑器 / 系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
