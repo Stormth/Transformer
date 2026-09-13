@@ -34,6 +34,8 @@
 from __future__ import annotations
 
 import argparse
+import math
+import re
 import shutil
 import time
 import urllib.request
@@ -217,10 +219,126 @@ def read_moses_pairs(directory: Path) -> List[Tuple[str, str]]:
     source = read_lines(en_files[0])
     target = read_lines(de_files[0])
     if len(source) != len(target):
-        raise ValueError(
-            f"两个文件行数不一致：{en_files[0].name}={len(source)}，{de_files[0].name}={len(target)}"
+        logger.warning(
+            f"两侧行数不一致（英文 {len(source)} 行、德文 {len(target)} 行），"
+            "按「句子内部换行」修复后再对齐"
         )
-    return list(zip(source, target))
+    return align_parallel_lines(source, target)
+
+
+# 单条对齐代价的上限：避免个别长度极端的句子 dominate 整个最优路径
+_MAX_PAIR_COST = 3.0
+
+
+def _pair_cost(short_record: str, long_record: str) -> float:
+    """一对句子的代价：长度比例偏离 1 的对数幅度（用 log 是为了左右对称）。"""
+
+    if not short_record or not long_record:
+        return _MAX_PAIR_COST
+    return min(_MAX_PAIR_COST, abs(math.log(len(long_record) / len(short_record))))
+
+
+def align_parallel_lines(
+    source: Sequence[str],
+    target: Sequence[str],
+    max_extra: int = 8,
+) -> List[Tuple[str, str]]:
+    """把两侧的 moses 行对齐成句对，顺手修掉「句子内部换行」。
+
+    为什么需要这一步？moses 格式规定"一行一句"，但真实文件偶尔犯规：
+    本项目用的 de-en 包里就有 5 处德语句子被换行拆成两行，
+    于是 de 文件比 en 文件多 5 行，直接 zip() 的话从错位点开始全乱。
+
+    做法是一次**单调对齐**（和编辑距离同一类思路）：
+
+        状态：把短侧的 i 条记录配完、并已经多用掉 k 行长侧
+        转移：① 一对一      短[i] 配 长[i+k]
+             ② 一对二合并  短[i] 配 长[i+k] + " " + 长[i+k+1]   （k += 1）
+        代价：|log(长侧长度 / 短侧长度)|，越接近 1 越好
+        终点：必须恰好把 k 用到 max_extra（也就是把所有多余行都合并掉）
+
+    因为多出来的行数很少（这里是 5），k 的取值只有 0~5 这几种，
+    状态数 = 句子数 × 6，几秒钟就能算完 4.6 万句。
+
+    为什么不用"这一行没有句末标点就合并"这种启发式？
+    因为德语新闻里有大量没有标点的标题行，误合并会让**后面所有句子**都错位。
+    DP 是在全局找一个总代价最小的方案，稳得多。
+    """
+
+    if len(source) == len(target):
+        return list(zip(source, target))
+
+    if len(source) > len(target):
+        long_side, short_side, long_is_source = list(source), list(target), True
+    else:
+        long_side, short_side, long_is_source = list(target), list(source), False
+
+    extra_total = len(long_side) - len(short_side)
+    if extra_total > max_extra:
+        raise ValueError(
+            f"两侧行数相差 {extra_total} 行（英文 {len(source)}、德文 {len(target)}），"
+            f"超过容忍上限 {max_extra}。这不像是「句子内部换行」，请检查语料文件是否完整。"
+        )
+
+    n_short, n_long = len(short_side), len(long_side)
+    inf = float("inf")
+    # dp[i][k]：配完前 i 条短侧记录、已多用 k 行长侧的最小代价
+    dp = [[inf] * (extra_total + 1) for _ in range(n_short + 1)]
+    choice: List[List[Optional[bool]]] = [[None] * (extra_total + 1) for _ in range(n_short + 1)]
+    dp[0][0] = 0.0
+
+    for i in range(n_short):
+        for k in range(extra_total + 1):
+            base = dp[i][k]
+            if base == inf:
+                continue
+            j = i + k                                  # 长侧下标
+            if j >= n_long:
+                continue
+            # ① 一对一
+            cost = base + _pair_cost(short_side[i], long_side[j])
+            if cost < dp[i + 1][k]:
+                dp[i + 1][k] = cost
+                choice[i + 1][k] = False
+            # ② 把长侧相邻两行合并成一句
+            if k < extra_total and j + 1 < n_long:
+                merged = long_side[j] + " " + long_side[j + 1]
+                cost = base + _pair_cost(short_side[i], merged)
+                if cost < dp[i + 1][k + 1]:
+                    dp[i + 1][k + 1] = cost
+                    choice[i + 1][k + 1] = True
+
+    if dp[n_short][extra_total] == inf:
+        raise ValueError("对齐失败：找不到合法的单调对齐方案")
+
+    # 回溯，还原每一步是"一对一"还是"合并"
+    merges: List[int] = []
+    k = extra_total
+    for i in range(n_short, 0, -1):
+        if choice[i][k]:
+            merges.append(i - 1)                        # 第 i-1 条短记录对应一次合并
+            k -= 1
+    merges.reverse()
+
+    pairs: List[Tuple[str, str]] = []
+    short_index = long_index = 0
+    merge_at = set(merges)
+    while short_index < n_short:
+        record = long_side[long_index]
+        if short_index in merge_at:
+            record = record + " " + long_side[long_index + 1]
+            long_index += 1
+        counterpart = short_side[short_index]
+        pairs.append((record, counterpart) if long_is_source else (counterpart, record))
+        short_index += 1
+        long_index += 1
+
+    if merges:
+        logger.info(
+            f"修复了 {len(merges)} 处「句子内部换行」（"
+            f"{'英文' if long_is_source else '德文'}侧，位置约 {merges[:8]}）"
+        )
+    return pairs
 
 
 def read_wmt_news_splits(directory: Path) -> Dict[str, List[Tuple[str, str]]]:

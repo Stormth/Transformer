@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
-import torch.nn.functional as F
 
-from nmt.corpus import encode_split, save_split
+from nmt.corpus import align_parallel_lines, encode_split, save_split
 from nmt.dataset import LengthBucketSampler, ParallelTextDataset, collate_batch
 from nmt.synth import toy_pairs
 
@@ -13,6 +13,36 @@ from nmt.synth import toy_pairs
 def _write_split(path, tokenizer, pairs, max_len: int = 64) -> None:
     result = encode_split(pairs, tokenizer, max_len, max_len)
     save_split(path, *result[:4], result[5])
+
+
+def test_align_is_identity_when_lengths_match() -> None:
+    en = ["Hello world.", "How are you today?"]
+    de = ["Hallo Welt.", "Wie geht es dir heute?"]
+    assert align_parallel_lines(en, de) == list(zip(en, de))
+
+
+def test_align_repairs_sentence_split_across_lines() -> None:
+    """真实语料里偶尔有句子被换行拆开（本项目用的 de-en 包里有 5 处）。
+
+    如果不修，从错位点开始后面**所有**句对都会错位 —— 这是最隐蔽的数据 bug 之一。
+    """
+
+    en = ["Hello world.", "How are you today?", "Fine."]
+    de = ["Hallo Welt.", "Wie geht es dir", "heute?", "Gut."]
+    pairs = align_parallel_lines(en, de)
+
+    assert len(pairs) == len(en)
+    assert pairs[1] == ("How are you today?", "Wie geht es dir heute?")
+    assert pairs[2] == ("Fine.", "Gut.")
+
+
+def test_align_refuses_hopeless_mismatch() -> None:
+    """行数差得太多说明文件本身有问题，应该明确报错而不是硬凑。"""
+
+    en = ["one", "two"]
+    de = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
+    with pytest.raises(ValueError):
+        align_parallel_lines(en, de)
 
 
 def test_collate_pads_to_batch_max() -> None:
