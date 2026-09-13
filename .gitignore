@@ -2,17 +2,30 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# 训练产物（可用 python -m src.build_data / python -m src.train 重新生成）
+# 语料：用 python -m nmt.corpus 重新下载即可，不该进仓库（几十 MB 的压缩包 + 上百万行文本）
+data/raw/
+data/ready/
 data/processed/
 data/processed_*/
+
+# 训练产物：用 python -m nmt.train / python -m nmt.inspect 重新生成
 checkpoints/
 checkpoints_*/
 attention_report.html
+attention.html
 train_console.txt
 *.log
+*.tmp
+
+# 评测输出
+preds/
+*.pred
 
 # 编辑器 / 系统文件
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Jupyter 检查点
+.ipynb_checkpoints/

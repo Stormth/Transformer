@@ -1,6 +1,12 @@
-# 本项目刻意只依赖 PyTorch：分词器、BLEU、注意力可视化全部用标准库实现，
-# 这样你能看清每个环节到底做了什么，也不会被 numpy / sacrebleu 等依赖的版本问题卡住。
+# 本项目刻意只依赖 PyTorch：分词器（BPE）、BLEU/chrF、注意力可视化全部用标准库手写。
+# 这样你能看清每个环节到底做了什么，也不会被 numpy / sacrebleu 之类的版本问题卡住。
+#
+#   pip install -r requirements.txt
+#
 torch>=2.0
 
-# 可选：运行单元测试
+# --- 以下都是可选的，不装也能跑完整流程 ---
+# 单元测试（61 个不变量测试，强烈建议装上）
 pytest>=7.0
+# 训练曲线可视化（不装的话 checkpoints/train_log.csv 用 Excel 看也一样）
+# tensorboard>=2.12
