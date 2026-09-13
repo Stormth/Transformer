@@ -211,7 +211,10 @@ def base_config(vocab_size: int = 16000) -> Config:
         train=TrainConfig(
             max_src_len=192,
             max_tgt_len=192,
-            max_tokens=8192,
+            # 动态 batching 的 token 预算。中英句对平均约 110 个 token（含 <bos>/<eos>），
+            # 16384 大约等于 150 句一批；4090 的 24 GB 显存完全放得下。
+            # 如果 OOM：先降到 8192，再用 accum_steps=2 把等效 batch size 补回来。
+            max_tokens=16384,
             max_sentences=128,
             epochs=30,
             warmup_steps=4000,

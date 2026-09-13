@@ -26,7 +26,7 @@ import torch
 from .bleu import evaluate_all
 from .dataset import ParallelTextDataset
 from .inference import Translator, select_eval_indices, translate_dataset
-from .utils import ensure_dir, get_logger, human_time, read_lines, resolve_device, setup_console, write_lines, Timer
+from .utils import Timer, ensure_dir, get_logger, human_time, read_lines, setup_console, write_lines
 
 logger = get_logger()
 

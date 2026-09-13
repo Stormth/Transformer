@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 
 from .inference import Translator
-from .masks import make_incremental_self_attn_mask, make_encoder_attn_mask, make_decoder_self_attn_mask
+from .masks import make_decoder_self_attn_mask, make_encoder_attn_mask
 from .utils import ensure_dir, get_logger, setup_console
 
 logger = get_logger()

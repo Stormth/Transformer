@@ -46,9 +46,18 @@ def translate_dataset(
     max_tokens: int = 4096,
     length_penalty: float = 0.6,
     max_len: int = 192,
+    adaptive_max_len: bool = True,
     progress=None,
 ) -> List[str]:
-    """对数据集里的若干句做翻译，返回和 indices 顺序一致的译文列表。"""
+    """对数据集里的若干句做翻译，返回和 indices 顺序一致的译文列表。
+
+    adaptive_max_len：按输入长度动态限制生成长度（默认开）。
+    为什么需要它？译文长度通常和原文相当，但**训练不足的模型不会输出 <eos>**，
+    于是每句都会硬生成到 max_len=192 才停 —— 评测 2 万句时这会让耗时翻好几倍，
+    而且多出来的部分全是废话。这里按"原文长度的 2 倍 + 10"封顶，
+    既能容纳正常的译文膨胀，又能把这些无意义的步数砍掉。
+    想看模型"到底会不会自己停"，把它关掉即可。
+    """
 
     model.eval()
     selected = list(range(len(dataset))) if indices is None else list(indices)
@@ -77,18 +86,22 @@ def translate_dataset(
         collated = collate_batch(samples, pad_id)
         src = collated["src"].to(device)
         src_mask = make_encoder_attn_mask(src, pad_id)
+        step_max_len = max_len
+        if adaptive_max_len:
+            source_len = int(collated["src"].size(1))
+            step_max_len = min(max_len, max(16, source_len * 2 + 10))
 
         if beam_size <= 1:
             sequences = greedy_decode(
                 model, src, src_mask,
                 bos_id=tokenizer.bos_id, eos_id=tokenizer.eos_id, pad_id=pad_id,
-                max_len=max_len,
+                max_len=step_max_len,
             )
         else:
             sequences, _ = beam_search_decode(
                 model, src, src_mask,
                 bos_id=tokenizer.bos_id, eos_id=tokenizer.eos_id, pad_id=pad_id,
-                beam_size=beam_size, max_len=max_len, length_penalty=length_penalty,
+                beam_size=beam_size, max_len=step_max_len, length_penalty=length_penalty,
             )
         for index, sequence in zip(batch_indices, sequences):
             hypotheses[index] = tokenizer.decode(sequence)
