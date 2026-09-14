@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from nmt.corpus import align_parallel_lines, encode_split, save_split
+from nmt.corpus import align_parallel_lines, encode_split, read_moses_pairs, save_split
 from nmt.dataset import LengthBucketSampler, ParallelTextDataset, collate_batch
 from nmt.synth import toy_pairs
 
@@ -36,13 +36,35 @@ def test_align_repairs_sentence_split_across_lines() -> None:
     assert pairs[2] == ("Fine.", "Gut.")
 
 
-def test_align_refuses_hopeless_mismatch() -> None:
-    """行数差得太多说明文件本身有问题，应该明确报错而不是硬凑。"""
+def test_align_truncates_on_large_mismatch() -> None:
+    """行数差得太多（超过修复上限）时按较短一侧截断，而不是硬对齐或报错。
+
+    WMT 的官方语料就是这样：News Commentary v9 两侧差 141 行，
+    而且错位量在文件里来回摆动（不是单调累积），没有便宜的修法。
+    工业上的常规做法就是截断：损失 0.1% 的数据，省掉一个真正的句子对齐器。
+    """
 
     en = ["one", "two"]
     de = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]
-    with pytest.raises(ValueError):
-        align_parallel_lines(en, de)
+    pairs = align_parallel_lines(en, de)
+    assert len(pairs) == len(en)
+    assert pairs[0] == ("one", "a")
+
+
+def test_read_pairs_does_not_split_on_unicode_line_separator(tmp_path) -> None:
+    """U+2028 不是换行符。
+
+    str.splitlines() 会把 U+2028、\\x0c 这些也当换行，于是句子中间被切开、
+    两侧行数凭空对不上。WMT 的 News Commentary v9 里就有 7 处 U+2028，
+    这个坑会直接导致几万句错位。
+    """
+
+    (tmp_path / "pair.en").write_text("Hello\u2028world\nSecond line\n", encoding="utf-8")
+    (tmp_path / "pair.de").write_text("Hallo\u2028Welt\nZweite Zeile\n", encoding="utf-8")
+    pairs = read_moses_pairs(tmp_path)
+    assert len(pairs) == 2
+    assert pairs[0][0] == "Hello\u2028world"
+    assert pairs[1] == ("Second line", "Zweite Zeile")
 
 
 def test_collate_pads_to_batch_max() -> None:

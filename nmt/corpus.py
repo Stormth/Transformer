@@ -37,6 +37,7 @@ import argparse
 import math
 import re
 import shutil
+import tarfile
 import time
 import urllib.request
 import zipfile
@@ -64,13 +65,15 @@ DATA_PAIR = "en-de"
 # --------------------------------------------------------------------------
 @dataclass(frozen=True)
 class CorpusSpec:
-    """一份 OPUS 语料的元信息。"""
+    """一份平行语料的元信息。"""
 
     name: str
     url: str
     domain: str
     note: str = ""
     default_max_pairs: int = 0  # 0 = 全部使用
+    archive: str = "zip"        # zip（OPUS 的打包方式）或 tgz（WMT 官方打包）
+    pattern: str = ""           # 一个包里混着多个语言对时，用文件名里的片段筛选，例如 "de-en"
 
 
 # 训练语料：新闻评论域，英德约 29.4 万句对（是常见语言对里质量最好的中等规模语料之一）
@@ -127,6 +130,42 @@ WMT_SPLITS = {
 }
 
 
+# WMT14 英德全量训练数据 —— 论文《Attention Is All You Need》用的就是这三份，约 456 万句对：
+#
+#   Europarl v7      196 万   欧洲议会辩论，正式书面语
+#   Common Crawl     240 万   网页抓取，量最大、噪声也最大
+#   News Commentary   20 万   新闻评论
+#
+# 三份都来自 WMT 官方的 tar.gz（不是 OPUS 的 zip），而且**一个包里混着多个语言对**
+# （比如 NC v9 里同时有 de-en / cs-en / fr-en / ru-en），所以要用 pattern 筛出 de-en。
+WMT14_RECIPE: List[CorpusSpec] = [
+    CorpusSpec(
+        name="wmt14-europarl.de-en",
+        url="https://www.statmt.org/europarl/v7/de-en.tgz",
+        domain="欧洲议会",
+        note="Europarl v7，约 196 万句对",
+        archive="tgz",
+        pattern="de-en",
+    ),
+    CorpusSpec(
+        name="wmt14-commoncrawl.de-en",
+        url="https://www.statmt.org/wmt13/training-parallel-commoncrawl.tgz",
+        domain="网页抓取",
+        note="Common Crawl，约 240 万句对，最脏也最大",
+        archive="tgz",
+        pattern="de-en",
+    ),
+    CorpusSpec(
+        name="wmt14-news-commentary.de-en",
+        url="https://www.statmt.org/wmt14/training-parallel-nc-v9.tgz",
+        domain="新闻评论",
+        note="News Commentary v9，约 20 万句对",
+        archive="tgz",
+        pattern="de-en",
+    ),
+]
+
+
 # --------------------------------------------------------------------------
 # 下载 / 解压
 # --------------------------------------------------------------------------
@@ -164,13 +203,17 @@ def download(url: str, dest: Path, force: bool = False) -> Path:
     return dest
 
 
-def extract(zip_path: Path, dest_dir: Path, force: bool = False) -> Path:
-    """解压 OPUS 的 moses 格式包。
+def extract(
+    archive_path: Path,
+    dest_dir: Path,
+    force: bool = False,
+    archive: str = "zip",
+) -> Path:
+    """解压语料包。
 
-    解压出来通常有三样东西：
-        *.en / *.de   每行一句的平行文本
-        *.xml         句子级对齐表（能看出哪些句子属于哪个文档）
-        LICENSE/README
+    OPUS 给的是 zip，里层是 *.en / *.de / *.xml；
+    WMT 官方给的是 tar.gz，里层通常是 training/ 目录下的一堆 *.en / *.de，
+    而且一个包里混着多个语言对（靠 CorpusSpec.pattern 在读取阶段筛选）。
     """
 
     dest_dir = Path(dest_dir)
@@ -180,8 +223,15 @@ def extract(zip_path: Path, dest_dir: Path, force: bool = False) -> Path:
     if dest_dir.exists():
         shutil.rmtree(dest_dir)
     ensure_dir(dest_dir)
-    with zipfile.ZipFile(zip_path) as archive:
-        archive.extractall(dest_dir)
+    if archive == "tgz":
+        with tarfile.open(archive_path) as tar:
+            try:
+                tar.extractall(dest_dir, filter="data")   # Python 3.12+ 推荐显式声明
+            except TypeError:                             # 老版本没有 filter 参数
+                tar.extractall(dest_dir)
+    else:
+        with zipfile.ZipFile(archive_path) as zip_file:
+            zip_file.extractall(dest_dir)
     marker.write_text("ok", encoding="utf-8")
     logger.info(f"已解压到 {dest_dir}")
     return dest_dir
@@ -190,34 +240,60 @@ def extract(zip_path: Path, dest_dir: Path, force: bool = False) -> Path:
 def fetch_corpus(spec: CorpusSpec, raw_dir: Path, force: bool = False) -> Path:
     """下载 + 解压，返回解压目录。"""
 
-    zip_path = raw_dir / f"{spec.name}.zip"
-    download(spec.url, zip_path, force=force)
-    return extract(zip_path, raw_dir / spec.name, force=force)
+    suffix = ".tgz" if spec.archive == "tgz" else ".zip"
+    archive_path = raw_dir / f"{spec.name}{suffix}"
+    download(spec.url, archive_path, force=force)
+    return extract(archive_path, raw_dir / spec.name, force=force, archive=spec.archive)
 
 
 # --------------------------------------------------------------------------
 # 读取
 # --------------------------------------------------------------------------
-def read_moses_pairs(directory: Path) -> List[Tuple[str, str]]:
+def read_moses_pairs(directory: Path, pattern: str = "") -> List[Tuple[str, str]]:
     """读 moses 格式的 .en / .de 两个文件，按行配成句对。
 
     返回 (英文, 德文) —— 也就是英译德方向。
     注意 OPUS 的包名是 de-en，但文件是分开的，方向由我们读的顺序决定。
+
+    用 rglob 递归找、按"去掉扩展名后的名字"配对，并对 pattern 做筛选：
+    WMT 的 tar 包里文件在 training/ 子目录下，而且混着多个语言对
+    （`news-commentary-v9.de-en.en`、`...cs-en.en`、`...fr-en.en` …），
+    靠 pattern="de-en" 才能只挑出英德那一对。
     """
 
     directory = Path(directory)
-    en_files = list(directory.glob("*.en"))
-    de_files = list(directory.glob("*.de"))
-    if not en_files or not de_files:
-        raise FileNotFoundError(f"{directory} 里没有找到 *.en / *.de 文件")
+    en_files = sorted(p for p in directory.rglob("*.en") if pattern in p.name)
+    de_files = sorted(p for p in directory.rglob("*.de") if pattern in p.name)
+    de_by_stem = {p.name[: -len(".de")]: p for p in de_files}
+
+    candidates = [(p, de_by_stem[p.name[: -len(".en")]]) for p in en_files if p.name[: -len(".en")] in de_by_stem]
+    if not candidates:
+        found = sorted(p.name for p in directory.rglob("*") if p.is_file())[:20]
+        raise FileNotFoundError(
+            f"{directory} 里没有找到成对的 *.en / *.de 文件（pattern={pattern!r}）。"
+            f"目录下实际有：{found}"
+        )
+    if len(candidates) > 1:
+        names = ", ".join(en.name for en, _ in candidates[:8])
+        raise ValueError(
+            f"{directory} 里匹配到 {len(candidates)} 组候选（{names}），"
+            "请用 CorpusSpec.pattern 精确指定要哪一组"
+        )
+    en_path, de_path = candidates[0]
 
     # errors="replace" 会把坏字节换成 U+FFFD 而不是直接抛异常，
     # 这样我们能"看得见"坏行，并在清洗阶段把它们挑出来。
     def read_lines(path: Path) -> List[str]:
-        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+        # 注意：这里**必须**只按 "\n" 切，不能用 str.splitlines()。
+        # splitlines() 会把 U+2028、\x0c 这些少见的分隔符也当换行，
+        # 于是句子中间被切开、两侧行数凭空对不上（WMT 的 NC v9 里就有 7 处 U+2028）。
+        lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
+        if lines and lines[-1] == "":     # 文件末尾的换行会多出一个空串
+            lines.pop()
+        return lines
 
-    source = read_lines(en_files[0])
-    target = read_lines(de_files[0])
+    source = read_lines(en_path)
+    target = read_lines(de_path)
     if len(source) != len(target):
         logger.warning(
             f"两侧行数不一致（英文 {len(source)} 行、德文 {len(target)} 行），"
@@ -275,10 +351,16 @@ def align_parallel_lines(
 
     extra_total = len(long_side) - len(short_side)
     if extra_total > max_extra:
-        raise ValueError(
+        # 差得多说明两侧的句子切分本来就不一致（WMT 官方语料常见，比如 NC v9 差 141 行，
+        # 而且错位量在文件里来回摆动，不是单调累积）。这种情况没有便宜的修法，
+        # 工业上的常规做法就是**按较短的一侧截断**：损失 0.1% 的数据，
+        # 换来的是不用引入一个真正的句子对齐器。论文当年的预处理也是这么做的。
+        logger.warning(
             f"两侧行数相差 {extra_total} 行（英文 {len(source)}、德文 {len(target)}），"
-            f"超过容忍上限 {max_extra}。这不像是「句子内部换行」，请检查语料文件是否完整。"
+            f"超过 {max_extra} 行的修复上限，按较短一侧截断到 {min(len(source), len(target))} 行"
         )
+        limit = min(len(source), len(target))
+        return list(zip(source[:limit], target[:limit]))
 
     n_short, n_long = len(short_side), len(long_side)
     inf = float("inf")
@@ -565,33 +647,61 @@ def encode_split(
     返回值里最后一项是"过滤后保留下来的句对原文"：
     BLEU 必须在原始文本上算，不能拿解码回来的字符串去比，
     否则分词器的空格规则会污染指标。
+
+    **分块编码**：一块一块地把 id 变成张量，而不是先攒成 list[list[int]]。
+    456 万句如果全攒在 Python 里，光这两层列表就要十几 GB 内存
+    （每个 int 是 28 字节的对象）。分块之后，峰值只由"最大一块 + 最终张量"决定。
     """
 
-    src_sequences: List[List[int]] = []
-    tgt_sequences: List[List[int]] = []
+    chunk_size = 100_000
+    src_flat_parts: List[torch.Tensor] = []
+    src_len_parts: List[torch.Tensor] = []
+    tgt_flat_parts: List[torch.Tensor] = []
+    tgt_len_parts: List[torch.Tensor] = []
     kept_pairs: List[Tuple[str, str]] = []
-    for source, target in pairs:
-        src_ids = tokenizer.encode(source, add_eos=True)
-        tgt_ids = tokenizer.encode(target, add_bos=True, add_eos=True)
-        if len(src_ids) > max_src_len or len(tgt_ids) > max_tgt_len:
-            continue
-        src_sequences.append(src_ids)
-        tgt_sequences.append(tgt_ids)
-        kept_pairs.append((source, target))
+    dropped = 0
 
-    if not src_sequences:
+    for start in range(0, len(pairs), chunk_size):
+        src_sequences: List[List[int]] = []
+        tgt_sequences: List[List[int]] = []
+        for source, target in pairs[start : start + chunk_size]:
+            src_ids = tokenizer.encode(source, add_eos=True)
+            tgt_ids = tokenizer.encode(target, add_bos=True, add_eos=True)
+            if len(src_ids) > max_src_len or len(tgt_ids) > max_tgt_len:
+                dropped += 1
+                continue
+            src_sequences.append(src_ids)
+            tgt_sequences.append(tgt_ids)
+            kept_pairs.append((source, target))
+        if not src_sequences:
+            continue
+        src_flat_parts.append(torch.tensor([t for seq in src_sequences for t in seq], dtype=torch.int32))
+        src_len_parts.append(torch.tensor([len(seq) for seq in src_sequences], dtype=torch.int32))
+        tgt_flat_parts.append(torch.tensor([t for seq in tgt_sequences for t in seq], dtype=torch.int32))
+        tgt_len_parts.append(torch.tensor([len(seq) for seq in tgt_sequences], dtype=torch.int32))
+
+    if not src_flat_parts:
         raise ValueError("过滤后一句都没剩下，检查一下 max_src_len / max_tgt_len 是不是太小")
 
-    def flatten(sequences: List[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
-        lengths = torch.tensor([len(s) for s in sequences], dtype=torch.int32)
-        flat = torch.tensor([token for seq in sequences for token in seq], dtype=torch.int32)
-        return flat, lengths
+    def concatenate(parts: List[torch.Tensor]) -> torch.Tensor:
+        """先分配好再逐块拷贝。torch.cat 会同时持有输入和输出两份，峰值翻倍。"""
 
-    src_flat, src_lengths = flatten(src_sequences)
-    tgt_flat, tgt_lengths = flatten(tgt_sequences)
+        total = sum(int(part.numel()) for part in parts)
+        merged = torch.empty(total, dtype=parts[0].dtype)
+        offset = 0
+        for part in parts:
+            merged[offset : offset + part.numel()] = part
+            offset += int(part.numel())
+        return merged
+
+    src_flat = concatenate(src_flat_parts)
+    src_lengths = concatenate(src_len_parts)
+    tgt_flat = concatenate(tgt_flat_parts)
+    tgt_lengths = concatenate(tgt_len_parts)
 
     stats = {
-        "pairs": len(src_sequences),
+        "pairs": len(kept_pairs),
+        "dropped_too_long": dropped,
         "src_tokens": int(src_lengths.sum()),
         "tgt_tokens": int(tgt_lengths.sum()),
         "src_len_mean": float(src_lengths.float().mean()),
@@ -642,6 +752,7 @@ def build_dataset(
     vocab_size: int = 32000,
     max_src_len: int = 192,
     max_tgt_len: int = 192,
+    recipe: str = "opus",
     extras: Sequence[str] = (),
     extra_pairs: int = 0,
     max_train_pairs: int = 0,
@@ -649,7 +760,12 @@ def build_dataset(
     skip_download: bool = False,
     seed: int = 2024,
 ) -> Dict[str, object]:
-    """完整流程：下载 -> 清洗 -> 训练 BPE -> 编码 -> 落盘。"""
+    """完整流程：下载 -> 清洗 -> 训练 BPE -> 编码 -> 落盘。
+
+    recipe 决定用哪套训练语料：
+        "opus"  —— 只用 News-Commentary v16（英德 29.4 万句对），准备起来快
+        "wmt14" —— 论文设置：Europarl v7 + Common Crawl + News Commentary v9（约 456 万句对）
+    """
 
     set_seed(seed)
     data_dir = Path(data_dir)
@@ -660,44 +776,55 @@ def build_dataset(
     meta: Dict[str, object] = {
         "pair": DATA_PAIR,
         "format_version": 2,
+        "recipe": recipe,
         "vocab_size": vocab_size,
         "sources": {},
     }
 
-    # --- 1. 训练语料 ---
+    # --- 1. 训练语料（可能有多份，逐份下载 / 清洗 / 累加）---
     logger.info("=" * 68)
-    logger.info("第 1 步：准备训练语料")
-    with Timer() as timer:
-        directory = (
-            fetch_corpus(NEWS_COMMENTARY, raw_dir) if not skip_download else raw_dir / NEWS_COMMENTARY.name
-        )
-        raw_train = read_moses_pairs(directory)
-        logger.info(f"读入 {len(raw_train)} 句（{timer.elapsed:.1f}s）")
+    logger.info(f"第 1 步：准备训练语料（recipe={recipe}）")
 
-    train_pairs, train_stats = clean_pairs(raw_train, clean_config)
-    logger.info(f"News-Commentary 清洗结果：\n{train_stats.report()}")
-    meta["sources"]["news-commentary"] = {"raw": len(raw_train), "kept": len(train_pairs)}
+    if recipe == "wmt14":
+        training_specs = list(WMT14_RECIPE)
+    elif recipe == "opus":
+        training_specs = [NEWS_COMMENTARY]
+    else:
+        raise ValueError(f"未知的 recipe {recipe!r}，可选：opus / wmt14")
 
-    # --- 2. 可选的加餐语料 ---
-    for name in extras:
+    for name in extras:   # 加餐语料拼在后面
         if name not in EXTRA_CORPORA:
             raise ValueError(f"未知的加餐语料 {name!r}，可选：{', '.join(EXTRA_CORPORA)}")
-        spec = EXTRA_CORPORA[name]
-        logger.info(f"加入额外语料：{spec.name}（{spec.domain}）")
-        directory = fetch_corpus(spec, raw_dir) if not skip_download else raw_dir / spec.name
-        extra_raw = read_moses_pairs(directory)
-        limit = extra_pairs if extra_pairs > 0 else spec.default_max_pairs
-        if limit > 0:
-            extra_raw = extra_raw[:limit]
-        extra_clean, extra_stats = clean_pairs(extra_raw, clean_config)
-        logger.info(f"{spec.name} 清洗结果：\n{extra_stats.report()}")
-        train_pairs.extend(extra_clean)
-        meta["sources"][name] = {
-            "raw": len(extra_raw),
-            "kept": len(extra_clean),
-            "domain": spec.domain,
-        }
+        extra_spec = EXTRA_CORPORA[name]
+        training_specs.append(
+            CorpusSpec(  # 加餐语料默认只取一部分，避免不小心把训练集撑得太大
+                name=extra_spec.name,
+                url=extra_spec.url,
+                domain=extra_spec.domain,
+                note=extra_spec.note,
+                default_max_pairs=extra_pairs if extra_pairs > 0 else extra_spec.default_max_pairs,
+                archive=extra_spec.archive,
+                pattern=extra_spec.pattern,
+            )
+        )
 
+    train_pairs: List[Tuple[str, str]] = []
+    for spec in training_specs:
+        logger.info(f"  · {spec.name}（{spec.domain}）：{spec.note}")
+        with Timer() as timer:
+            directory = fetch_corpus(spec, raw_dir) if not skip_download else raw_dir / spec.name
+            raw = read_moses_pairs(directory, spec.pattern)
+            logger.info(f"    读入 {len(raw):,} 句（{timer.elapsed:.1f}s）")
+        if spec.default_max_pairs > 0 and len(raw) > spec.default_max_pairs:
+            raw = raw[: spec.default_max_pairs]
+            logger.info(f"    按配置截断到 {len(raw):,} 句")
+        cleaned, stats = clean_pairs(raw, clean_config)
+        logger.info(f"    清洗：{stats.report().replace(chr(10), chr(10) + '    ')}")
+        train_pairs.extend(cleaned)
+        meta["sources"][spec.name] = {"raw": len(raw), "kept": len(cleaned), "domain": spec.domain}
+        del raw      # 及时释放，下一份语料还要占内存
+
+    # --- 2. 去重 + 可选截断 ---
     train_pairs, dropped = deduplicate(train_pairs)
     logger.info(f"去重丢掉 {dropped} 句，训练集共 {len(train_pairs)} 句")
 
@@ -795,6 +922,10 @@ def main() -> None:
     parser.add_argument("--data-dir", default="data", help="原始语料存放目录")
     parser.add_argument("--out", default="data/ready", help="处理后产物目录")
     parser.add_argument(
+        "--recipe", default="opus", choices=["opus", "wmt14"],
+        help="opus：只用 News-Commentary（29 万句对）；wmt14：论文设置 Europarl+CommonCrawl+NC v9（456 万句对）",
+    )
+    parser.add_argument(
         "--vocab-size", type=int, default=32000,
         help="联合 BPE 词表大小。英德这种形态丰富的语言对用 32k 比较标准；"
              "想快一倍可以降到 16000（BPE 训练时间大致与合并次数成正比）",
@@ -825,6 +956,7 @@ def main() -> None:
         vocab_size=args.vocab_size,
         max_src_len=args.max_src_len,
         max_tgt_len=args.max_tgt_len,
+        recipe=args.recipe,
         extras=args.extra,
         extra_pairs=args.extra_pairs,
         max_train_pairs=args.max_train_pairs,
