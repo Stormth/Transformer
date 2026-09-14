@@ -23,7 +23,8 @@
 1. **真实数据，真实分数**。用 WMT 官方测试集，BLEU 可以和论文、开源模型摆在一起比。
    很多教学项目用模板生成的合成语料，验证 BLEU 能到 99 —— 那个数字没有任何意义。
 2. **能证明自己写对了**。`nmt/verify.py` 把权重搬进官方 `nn.Transformer`，逐层对比输出；
-   `tests/` 里有 64 个不变量测试（因果性、KV cache 一致性、掩码、BLEU……）。
+   `tests/` 里有 77 个不变量测试（因果性、KV cache 一致性、掩码、BLEU、
+   多卡分片、checkpoint 平均……）。
 3. **能看见模型在看哪里**。`nmt/inspect.py` 输出张量形状追踪和注意力热力图（终端 + HTML）。
 4. **工程该有的都有**：混合精度、梯度累积、断点续训、长度分桶动态 batching、
    束搜索 + KV cache、TensorBoard（可选）。
@@ -157,47 +158,60 @@ python -m nmt.evaluate --checkpoint checkpoints/averaged.pt --split test2014 --b
 │   └── synth.py            合成语料（只用于测试，不要用来评测）
 ├── docs/                   0~11 章讲解
 ├── examples/tour.py        不需要数据和训练的形状导览
-├── tests/                  64 个不变量测试
+├── tests/                  77 个不变量测试
 ├── data/                   raw/（下载的语料）ready/（处理后的张量）—— 不入库
 └── checkpoints/            训练产物 —— 不入库
 ```
 
 ## 模型与训练配置
 
-| | tiny | small | base |
-| --- | --- | --- | --- |
-| d_model | 64 | 256 | 512 |
-| 注意力头数 | 4 | 4 | 8 |
-| 编码器/解码器层数 | 2 / 2 | 3 / 3 | 6 / 6 |
-| d_ff | 128 | 1024 | 2048 |
-| 参数量（词表 32k） | 约 2.2M | 约 14M | 约 60M |
-| 适用场景 | CPU 冒烟测试 | 笔记本 GPU | 单卡 4090 |
+| | tiny | small | base | paper-base | paper-big |
+| --- | --- | --- | --- | --- | --- |
+| d_model | 64 | 256 | 512 | 512 | 1024 |
+| 注意力头数 | 4 | 4 | 8 | 8 | 16 |
+| 编码器/解码器层数 | 2 / 2 | 3 / 3 | 6 / 6 | 6 / 6 | 6 / 6 |
+| d_ff | 128 | 1024 | 2048 | 2048 | 4096 |
+| dropout | 0 | 0.1 | 0.1 | 0.1 | 0.3 |
+| 参数量（词表 32k） | 约 2.2M | 约 14M | 约 60M | 约 60M | 约 213M |
+| 适用场景 | CPU 冒烟测试 | 笔记本 GPU | 单卡 4090 | 8 卡复现论文（27.3） | 8 卡冲 28+ |
 
 训练默认：标签平滑 0.1、Noam 学习率（warmup 4000）、混合精度、动态 batching、长度分桶、
 每轮验证 dev BLEU 并保存 `best.pt`。
+
+`paper-base` / `paper-big` 是按论文逐项对齐的预设（批大小、warmup、标签平滑、
+最后 5 个 checkpoint 平均、区分大小写的 BLEU 口径），细节见 [第 12 章](docs/12-reproduce.md)。
 
 ## 常用命令速查
 
 ```bash
 # 数据
 python -m nmt.corpus                                  # 默认：News-Commentary + WMT，32k 词表
+python -m nmt.corpus --recipe wmt14                   # 论文全量：Europarl+CommonCrawl+NC v9，456 万句对
 python -m nmt.corpus --vocab-size 16000               # 数据准备时间减半
 python -m nmt.corpus --extra europarl                 # 加 30 万句欧洲议会语料
 python -m nmt.corpus --extra ted2013 --extra multiun  # 换领域做对比实验
 python -m nmt.corpus --skip-download                  # 语料已下载好时跳过下载
 
-# 训练
+# 训练（单卡）
 python -m nmt.train --preset base
 python -m nmt.train --preset small --max-steps 500    # 限时冒烟
 python -m nmt.train --preset base --resume auto       # 断点续训（要用和原来相同的 --preset）
 python -m nmt.train --preset base --override train.lr_scale=0.5
 python -m nmt.train --preset base --override train.tensorboard=true
 
+# 训练（单机 8 卡，DDP）
+torchrun --nproc_per_node=8 -m nmt.train --preset paper-base --max-steps 100000
+torchrun --nproc_per_node=8 -m nmt.train --preset paper-base --max-steps 2000 --save-dir checkpoints/smoke  # 先冒烟
+
+# checkpoint 平均（论文报的分数是最后 5 个的平均）
+python -m nmt.average --checkpoint-dir checkpoints --num 5 --output checkpoints/averaged.pt
+
 # 翻译与评测
 python -m nmt.translate --checkpoint checkpoints/best.pt --beam-size 4 --text "..."
 python -m nmt.translate --checkpoint checkpoints/best.pt --file news.en --out news.de
 python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2014 --compare-decoders
 python -m nmt.evaluate --checkpoint checkpoints/best.pt --split test2014 --show 8 --save-pred out.txt
+python -m nmt.evaluate --checkpoint checkpoints/averaged.pt --split test2014 --beam-size 4 --case-sensitive
 
 # 观察模型内部 / 验证实现
 python -m nmt.inspect --checkpoint checkpoints/best.pt --shapes --html attention.html
@@ -207,11 +221,19 @@ python -m pytest tests -q
 
 ## 数据来源与许可
 
-* 训练语料：[News-Commentary v16](https://opus.nlpl.eu/News-Commentary/)（OPUS，英德方向）
-* 验证/测试：[WMT-News v2019](https://opus.nlpl.eu/WMT-News/)（含 newstest2008~2019）
+默认配方（`--recipe opus`）：
 
-两份语料都来自 OPUS 开放平台，各自带有原始许可（通常是 CC-BY / 允许研究使用）。
-本项目只做教学演示；商用请自行核对原始语料的许可条款。
+* 训练：[News-Commentary v16](https://opus.nlpl.eu/News-Commentary/)（OPUS，英德方向，29.4 万句对）
+* 验证/测试：[WMT-News v2019](https://opus.nlpl.eu/WMT-News/)（含 newstest2013~2019）
+
+复现配方（`--recipe wmt14`，论文用的那份）：
+
+* [Europarl v7](https://www.statmt.org/europarl/v7/de-en.tgz)（196 万句对）
+* [Common Crawl](https://www.statmt.org/wmt13/training-parallel-commoncrawl.tgz)（240 万句对）
+* [News Commentary v9](https://www.statmt.org/wmt14/training-parallel-nc-v9.tgz)（20 万句对）
+
+这些语料都来自 OPUS / WMT 的公开分发，各自带有原始许可（通常是 CC-BY / 允许研究使用）。
+本项目只做教学与复现演示；商用请自行核对原始语料的许可条款。
 
 ## 环境要求
 
