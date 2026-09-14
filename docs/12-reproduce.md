@@ -142,10 +142,28 @@ python -m nmt.evaluate --checkpoint checkpoints/averaged.pt --split test2014 --c
 
 ### CUDA out of memory
 
+**先分清是"真的不够"还是"卡被别人占着"**。8 卡跑 `paper-base` 时每卡只需要 5~6 GB，
+如果你看到某张卡显示 20 GB+ 已用，那基本不是你的模型吃的：
+
+```bash
+nvidia-smi                                          # 看每张卡的占用和进程
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+
+# 之前跑挂/被 Ctrl+C 的训练，worker 进程常常不会全退干净，会一直占着显存
+pkill -f "nmt.train"
+sleep 5 && nvidia-smi                               # 确认卡空了再重跑
+```
+
+确认是显存真不够，再按这个顺序压：
+
 ```bash
 --override train.max_tokens=32768          # 全局批减半
 --override train.accum_steps=2             # 用梯度累积补回等效批大小
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # 动态 batching 的形状变化多，缓解碎片
 ```
+
+训练时每轮会打印**各卡峰值显存**。如果这个数字随轮数缓慢上涨 → 是碎片或泄漏；
+如果某一轮突然跳上去 → 是某个 batch 异常大，看 `train_log.csv` 里那一轮的长度分布。
 
 ### 报错说"序列长度 N 超过了位置编码支持的最大长度"
 
