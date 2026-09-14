@@ -30,7 +30,24 @@ class LabelSmoothingLoss(nn.Module):
         self.smoothing = smoothing
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """logits: [B, T, V]（或 [N, V]）；target: [B, T]（或 [N]）。返回标量。"""
+        """logits: [B, T, V]（或 [N, V]）；target: [B, T]（或 [N]）。返回标量。
+
+        实现上是"公式版"而不是"分布版"：不构造 [N, V] 的目标分布张量。
+
+        为什么？词表 32000、一个 batch 5000 个 token 时，那个张量是 660 MB，
+        再加上逐元素相乘的临时结果，光损失函数就要 1.3 GB —— 这是多卡训练里
+        很典型的 OOM 来源（本项目的 8 卡跑就栽在这上面）。
+        正确的做法是把标签平滑写成两项之和：
+
+            loss = (1-eps)·(-log p(正确词)) + eps/(V-1)·(Σ_{v≠正确词} -log p(v))
+
+        注意第二项要**排除正确词自己**（原来那版是把正确词那格改写成 1-eps，
+        等于把它的 eps/(V-1) 那份抽掉了）。所以用"总和减去自己"来表示：
+
+            Σ_{v≠t} (-log p(v)) = smooth - nll
+
+        数学上和分布版逐位等价，但只需要 [N] 大小的中间量，不materialize [N, V]。
+        """
 
         vocab_size = logits.size(-1)
         logits = logits.reshape(-1, vocab_size)
@@ -38,17 +55,15 @@ class LabelSmoothingLoss(nn.Module):
 
         log_probs = F.log_softmax(logits, dim=-1)
 
-        with torch.no_grad():
-            true_dist = torch.full_like(log_probs, self.smoothing / (vocab_size - 1))
-            # 把正确词的位置改回 1 - smoothing（其实只需要 0.9 那一份"信任"）
-            true_dist.scatter_(1, target.unsqueeze(1), 1.0 - self.smoothing)
-            # padding 位置整行清零，不参与 loss
-            true_dist[target == self.pad_id] = 0.0
-            n_valid = (target != self.pad_id).sum().clamp(min=1)
+        valid = target != self.pad_id
+        # gather 出正确词的对数概率（padding 位置取到的是无关项，后面会被 mask 掉）
+        safe_target = target.masked_fill(~valid, 0)
+        nll = -log_probs.gather(dim=-1, index=safe_target.unsqueeze(-1)).squeeze(-1)
+        smooth = -log_probs.sum(dim=-1)
 
-        # 交叉熵就是 -sum(目标分布 * log 概率)
-        loss = -(true_dist * log_probs).sum() / n_valid
-        return loss
+        per_token = (1.0 - self.smoothing) * nll + self.smoothing / (vocab_size - 1) * (smooth - nll)
+        n_valid = valid.sum().clamp(min=1)
+        return (per_token * valid).sum() / n_valid
 
 
 class PlainCrossEntropy(nn.Module):

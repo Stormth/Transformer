@@ -31,6 +31,7 @@ import csv
 import logging
 import math
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -95,9 +96,20 @@ def setup_distributed(prefer_cuda: bool = True) -> Tuple[int, int, int]:
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     backend = "nccl" if (prefer_cuda and torch.cuda.is_available()) else "gloo"
-    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+    # 绑卡要在初始化进程组**之前**做：NCCL 会按当前设备建通信器，
+    # 晚绑一步会让 8 个进程的通信器都挂在 0 号卡上（带宽和显存都不划算）。
     if backend == "nccl":
         torch.cuda.set_device(local_rank)
+    try:
+        # device_id 是 torch 2.6 才有的参数，老版本会 TypeError，退回普通调用
+        dist.init_process_group(
+            backend=backend,
+            rank=rank,
+            world_size=world_size,
+            device_id=torch.device("cuda", local_rank) if backend == "nccl" else None,
+        )
+    except TypeError:
+        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     return rank, world_size, local_rank
 
 
@@ -207,6 +219,10 @@ def train(
         device = resolve_device(train_cfg.device)
     # 每个进程的随机种子错开，保证 dropout 的随机性不重复（数据分片由 sampler 负责）
     set_seed(train_cfg.seed + rank)
+    if world_size > 1:
+        # 每个进程都打一行，方便确认 8 个进程真的各自落在不同卡上。
+        # 用 print 而不是 logger，因为非主进程的 info 级别被压掉了。
+        print(f"[rank {rank}/{world_size}] 使用 {device}", file=sys.stderr, flush=True)
     if is_main:
         logger.info(
             f"进程数 {world_size}"
@@ -469,6 +485,18 @@ def train(
         elapsed = time.perf_counter() - epoch_start
         if skipped:
             logger.info(f"  本轮有 {skipped}/{update_count} 次更新因梯度非有限被跳过（GradScaler 自保护）")
+
+        # 峰值显存：跨卡取最大值打出来。多卡 OOM 最难判断的地方就是"看不到显存曲线"，
+        # 有了这个数就能看出是慢慢涨（碎片/泄漏）还是某个 batch 突然爆掉。
+        if device.type == "cuda":
+            peak_gb = torch.tensor([torch.cuda.max_memory_allocated(device) / 1024 ** 3])
+            if world_size > 1:
+                import torch.distributed as dist
+
+                dist.all_reduce(peak_gb, op=dist.ReduceOp.MAX)
+            if is_main:
+                logger.info(f"  {'各卡最大' if world_size > 1 else ''}峰值显存 {float(peak_gb.item()):.1f} GB")
+            torch.cuda.reset_peak_memory_stats(device)
 
         # --- 每轮结束：验证 + 保存 ---
         metrics: Dict[str, float] = {}
