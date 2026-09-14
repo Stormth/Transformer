@@ -59,6 +59,17 @@ torchrun --nproc_per_node=8 -m nmt.train \
   `总时间 ≈ 100000 步 × 50000 token ÷ (8 × 单卡 tok/s)`；
 * `checkpoints/smoke/` 下有 `last.pt` / `best.pt`。
 
+**进度显示有两种形态**（`--progress auto` 自动选）：
+
+* 在终端里跑（TTY）→ 一条原地刷新的进度条，带百分数、`step/s` 和 **ETA**：
+
+  ```
+  epoch 1/1000 ████████············ | 320/2000 | 16.0% | 2.41 step/s | ETA 11m36s | loss 7.8123 | lr 1.20e-04 | 41.2K tok/s
+  ```
+
+* 输出被重定向到文件（`> log` 或 `| tee`）→ 自动退化成每 `log_every_steps` 步一行日志，
+  免得日志文件里被 `\r` 弄成一堆互相覆盖的乱码。想强制开进度条用 `--progress on`。
+
 ## 3. 正式训练（3~6 小时）
 
 ### 先挂到后台再启动（重要）

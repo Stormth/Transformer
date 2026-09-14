@@ -61,7 +61,9 @@ def setup_console() -> None:
             continue
         logger = logging.getLogger(name)
         for handler in list(logger.handlers):
-            if isinstance(handler, logging.StreamHandler):
+            # 注意也要匹配我们自己的 _LiveStderrHandler（它不是 StreamHandler 的子类），
+            # 否则旧 handler 不会被移除、新 handler 又加一个，日志就会打印两遍。
+            if isinstance(handler, (logging.StreamHandler, _LiveStderrHandler)):
                 logger.removeHandler(handler)
         handler = _LiveStderrHandler()
         handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
@@ -226,3 +228,79 @@ class Timer:
 
     def __exit__(self, *exc: Any) -> None:
         self.elapsed = time.perf_counter() - self.start
+
+
+class ProgressBar:
+    """极简进度条：不依赖 tqdm，只往 stderr 写一行、用 \\r 原地刷新。
+
+    为什么自己写？本项目的卖点之一就是"只依赖 PyTorch"，为了一条进度条引入
+    tqdm 不值当；而且自己写才能控制两个关键行为：
+
+    * **只在 TTY 上画**。输出被重定向到文件时（`> log` 或 `| tee`），
+      带 \\r 的进度条会在日志里留下一堆互相覆盖的乱码 —— 这种情况自动退化成
+      "每隔 N 步打一行"，也就是原来那种日志。
+    * **只在真的要画的时候做 GPU 同步**。loss 要显示就得 `.item()`，
+      而每步同步会把流水线排空；这里把它限制在最多每 `min_interval` 秒一次。
+
+    多卡时只让 rank 0 构造它，否则 8 条进度条会互相覆盖。
+    """
+
+    def __init__(
+        self,
+        total: int,
+        label: str = "",
+        enabled: bool = True,
+        force: bool = False,
+        min_interval: float = 1.0,
+        width: int = 20,
+    ) -> None:
+        self.total = max(1, int(total))
+        self.label = label
+        self.width = width
+        self.min_interval = min_interval
+        # 不是 TTY 就不画：避免日志文件被 \r 搞乱
+        self.enabled = bool(enabled) and (force or sys.stderr.isatty())
+        self.start = time.perf_counter()
+        self._last_draw = 0.0
+        self._drawn = False
+
+    def _should_draw(self, step: int) -> bool:
+        if not self.enabled:
+            return False
+        if step >= self.total:      # 最后一步一定要画出来
+            return True
+        now = time.perf_counter()
+        if now - self._last_draw < self.min_interval:
+            return False
+        self._last_draw = now
+        return True
+
+    def update(self, step: int, loss: Optional[float] = None, lr: Optional[float] = None, tok_s: Optional[float] = None) -> None:
+        """调一次刷新一次（内部自己节流）。loss/lr/tok_s 传已经算好的数字。"""
+
+        if not self._should_draw(step):
+            return
+        fraction = min(1.0, step / self.total)
+        filled = int(self.width * fraction)
+        bar = "█" * filled + "·" * (self.width - filled)
+        elapsed = time.perf_counter() - self.start
+        rate = step / max(1e-9, elapsed)
+        eta = (self.total - step) / max(1e-9, rate)
+
+        parts = [f"{self.label}{bar}", f"{step}/{self.total}", f"{fraction:5.1%}",
+                 f"{rate:.2f} step/s", f"ETA {human_time(eta)}"]
+        if loss is not None:
+            parts.append(f"loss {loss:.4f}")
+        if lr:
+            parts.append(f"lr {lr:.2e}")
+        if tok_s:
+            parts.append(f"{format_big(tok_s)} tok/s")
+        print("\r" + " | ".join(parts), end="", file=sys.stderr, flush=True)
+        self._drawn = True
+
+    def finish(self) -> None:
+        """换行收尾，免得后面的日志接在进度条同一行上。"""
+
+        if self.enabled and self._drawn:
+            print("", file=sys.stderr, flush=True)
+            self._drawn = False

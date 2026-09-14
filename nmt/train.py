@@ -49,10 +49,12 @@ from .loss import build_criterion
 from .model import Transformer
 from .scheduler import NoamScheduler
 from .utils import (
+    ProgressBar,
     Timer,
     autocast_context,
     count_parameters,
     describe_device,
+    format_big,
     get_logger,
     human_time,
     load_json,
@@ -202,6 +204,7 @@ def train(
     resume: Optional[str] = None,
     max_steps: int = 0,
     prepare_data: bool = False,
+    progress: str = "auto",
 ) -> Dict[str, float]:
     train_cfg, model_cfg = config.train, config.model
 
@@ -399,6 +402,14 @@ def train(
     for epoch in range(start_epoch, epochs):
         sampler.set_epoch(epoch)
         model.train()
+        # 进度条：只在 rank 0 画（8 条会互相覆盖），并且只在 TTY 上画
+        # （重定向到日志文件时自动退化成下面的周期性日志行）
+        progress_bar = ProgressBar(
+            total=max_steps if max_steps else len(loader),
+            label="" if max_steps else f"epoch {epoch + 1}/{epochs} ",
+            enabled=is_main and progress != "off",
+            force=progress == "on",
+        )
         # 统计量全部用**张量**累加，而不是每步 float()/int()。
         # 原因：每步对 CUDA 张量做一次 .item()/float() 都会强制同步一次，
         # 把 GPU 流水线彻底排空。这个项目在 8 卡首跑时就吃了这个亏：
@@ -473,7 +484,16 @@ def train(
             epoch_grad_norm = epoch_grad_norm + torch.where(finite, grad_norm, torch.zeros_like(grad_norm))
             norm_count = norm_count + finite.float()
 
-            if global_step % train_cfg.log_every_steps == 0 or global_step == 1:
+            if progress_bar.enabled:
+                # 进度条模式下不再打周期性日志行（两者混着写会互相覆盖）。
+                # 这里才做同步取 loss，而且进度条内部节流到每秒最多一次。
+                progress_bar.update(
+                    global_step,
+                    loss=float(epoch_loss / epoch_tokens.clamp(min=1)),
+                    lr=lr,
+                    tok_s=float(epoch_tokens) / max(1e-6, time.perf_counter() - epoch_start),
+                )
+            elif global_step % train_cfg.log_every_steps == 0 or global_step == 1:
                 elapsed = time.perf_counter() - epoch_start
                 # 这里才做同步：每 log_every_steps 步一次，可以忽略
                 mean_loss = float(epoch_loss / epoch_tokens.clamp(min=1))
@@ -499,9 +519,11 @@ def train(
                     step=global_step, best_score=best_score, history=history,
                     vocab_path=str(data_dir / "vocab.json"),
                 )
+                progress_bar.finish()   # 先换行，否则这行日志会盖在进度条上
                 logger.info(f"  按 --save-every-steps 保存了 last.pt（第 {global_step} 步）")
 
             if max_steps and global_step >= max_steps:
+                progress_bar.finish()
                 logger.info(f"到达 --max-steps={max_steps}，提前结束本轮")
                 break
 
@@ -510,10 +532,11 @@ def train(
         train_loss = float(epoch_loss / epoch_tokens.clamp(min=1))
         avg_grad = float(epoch_grad_norm / norm_count.clamp(min=1))
         epoch_token_count = float(epoch_tokens)
+        progress_bar.finish()   # 换行，免得后面的日志接在进度条那一行
         if skipped:
             logger.info(f"  本轮有 {skipped}/{update_count} 次更新因梯度非有限被跳过（GradScaler 自保护）")
         logger.info(
-            f"  本轮 {epoch_token_count / 1e6:.1f}M token，"
+            f"  本轮 {format_big(epoch_token_count)} token，"
             f"{epoch_token_count / max(1e-6, elapsed):,.0f} tok/s（每卡）"
         )
 
@@ -674,6 +697,10 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=0, help="限制总步数，用来限时训练或冒烟测试")
     parser.add_argument("--override", action="append", default=[], help="覆盖配置，如 --override train.epochs=5")
     parser.add_argument("--prepare-data", action="store_true", help="训练前先准备数据")
+    parser.add_argument(
+        "--progress", default="auto", choices=["auto", "on", "off"],
+        help="进度条：auto=只在终端（TTY）上显示，重定向到日志文件时自动退化成周期性日志行",
+    )
     args = parser.parse_args()
 
     overrides = {}
@@ -694,7 +721,10 @@ def main() -> None:
     config = build_config(args.preset, overrides=overrides)
     if args.max_steps:
         config.train.max_steps = args.max_steps
-    train(config, Path(args.data_dir), Path(args.save_dir), resume=args.resume, max_steps=args.max_steps)
+    train(
+        config, Path(args.data_dir), Path(args.save_dir),
+        resume=args.resume, max_steps=args.max_steps, progress=args.progress,
+    )
 
 
 if __name__ == "__main__":
