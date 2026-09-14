@@ -29,7 +29,6 @@ import argparse
 import contextlib
 import csv
 import logging
-import math
 import os
 import sys
 import time
@@ -222,7 +221,8 @@ def train(
     if world_size > 1:
         # 每个进程都打一行，方便确认 8 个进程真的各自落在不同卡上。
         # 用 print 而不是 logger，因为非主进程的 info 级别被压掉了。
-        print(f"[rank {rank}/{world_size}] 使用 {device}", file=sys.stderr, flush=True)
+        # 用 ASCII 输出：有些终端/SSH 客户端是 GBK，中文会变成乱码
+        print(f"[rank {rank}/{world_size}] device={device}", file=sys.stderr, flush=True)
     if is_main:
         logger.info(
             f"进程数 {world_size}"
@@ -399,11 +399,17 @@ def train(
     for epoch in range(start_epoch, epochs):
         sampler.set_epoch(epoch)
         model.train()
-        epoch_loss = 0.0
-        epoch_tokens = 0
-        epoch_grad_norm = 0.0
+        # 统计量全部用**张量**累加，而不是每步 float()/int()。
+        # 原因：每步对 CUDA 张量做一次 .item()/float() 都会强制同步一次，
+        # 把 GPU 流水线彻底排空。这个项目在 8 卡首跑时就吃了这个亏：
+        # 每步有 3 处同步，步时被拖到 0.42 秒（本该 0.1 秒以内），
+        # 100k 步硬生生从 3 小时变成 12 小时。只在打日志的时候同步一次就够了。
+        zero = torch.zeros((), device=device)
+        epoch_loss = zero.clone()
+        epoch_tokens = zero.clone()
+        epoch_grad_norm = zero.clone()
+        norm_count = zero.clone()
         update_count = 0
-        norm_count = 0
         skipped = 0
         micro = 0
         epoch_start = time.perf_counter()
@@ -421,9 +427,9 @@ def train(
                 loss = criterion(logits, labels)
 
             micro += 1
-            n_tokens = int((labels != tokenizer.pad_id).sum())
-            epoch_loss += float(loss) * n_tokens
-            epoch_tokens += n_tokens
+            n_tokens = (labels != tokenizer.pad_id).sum()
+            epoch_loss = epoch_loss + loss.detach() * n_tokens
+            epoch_tokens = epoch_tokens + n_tokens
 
             is_update = (micro % accum == 0) or (batch_index == len(loader) - 1)
             scaled = loss / accum
@@ -445,7 +451,7 @@ def train(
 
             if scaler is not None:
                 scaler.unscale_(optimizer)
-                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), train_cfg.clip_grad)
+                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), train_cfg.clip_grad).detach()
                 scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
@@ -454,26 +460,29 @@ def train(
                 if scaler.get_scale() < scale_before:
                     skipped += 1
             else:
-                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), train_cfg.clip_grad)
+                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), train_cfg.clip_grad).detach()
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
             lr = scheduler.step()
             global_step += 1
             update_count += 1
-            norm_value = float(grad_norm)
-            # inf/nan 不参与平均，否则整个 epoch 的 grad_norm 统计会永远变成 inf
-            if math.isfinite(norm_value):
-                epoch_grad_norm += norm_value
-                norm_count += 1
+            # inf/nan 不参与平均（否则整个 epoch 的 grad_norm 会变成 inf）。
+            # 这里用 torch.where 在 GPU 上判断，不做 .item()，避免又引入一次同步。
+            finite = torch.isfinite(grad_norm)
+            epoch_grad_norm = epoch_grad_norm + torch.where(finite, grad_norm, torch.zeros_like(grad_norm))
+            norm_count = norm_count + finite.float()
 
             if global_step % train_cfg.log_every_steps == 0 or global_step == 1:
                 elapsed = time.perf_counter() - epoch_start
+                # 这里才做同步：每 log_every_steps 步一次，可以忽略
+                mean_loss = float(epoch_loss / epoch_tokens.clamp(min=1))
+                throughput = float(epoch_tokens) / max(1e-6, elapsed)
                 logger.info(
                     f"epoch {epoch + 1}/{epochs} | step {global_step} | "
-                    f"loss {epoch_loss / max(1, epoch_tokens):.4f} | "
+                    f"loss {mean_loss:.4f} | "
                     f"lr {lr:.2e} | grad {float(grad_norm):.2f} | "
-                    f"tok/s {epoch_tokens / max(1e-6, elapsed):,.0f}"
+                    f"tok/s {throughput:,.0f}"
                 )
 
             # 按步存盘：大语料下一个 epoch 可能一小时，只在轮末存的话一旦崩掉就白跑。
@@ -496,16 +505,27 @@ def train(
                 logger.info(f"到达 --max-steps={max_steps}，提前结束本轮")
                 break
 
-        train_loss = epoch_loss / max(1, epoch_tokens)
-        avg_grad = epoch_grad_norm / max(1, norm_count)
         elapsed = time.perf_counter() - epoch_start
+        # 一轮结束时才做同步，把这一轮的统计量取成 Python 数字
+        train_loss = float(epoch_loss / epoch_tokens.clamp(min=1))
+        avg_grad = float(epoch_grad_norm / norm_count.clamp(min=1))
+        epoch_token_count = float(epoch_tokens)
         if skipped:
             logger.info(f"  本轮有 {skipped}/{update_count} 次更新因梯度非有限被跳过（GradScaler 自保护）")
+        logger.info(
+            f"  本轮 {epoch_token_count / 1e6:.1f}M token，"
+            f"{epoch_token_count / max(1e-6, elapsed):,.0f} tok/s（每卡）"
+        )
 
         # 峰值显存：跨卡取最大值打出来。多卡 OOM 最难判断的地方就是"看不到显存曲线"，
         # 有了这个数就能看出是慢慢涨（碎片/泄漏）还是某个 batch 突然爆掉。
         if device.type == "cuda":
-            peak_gb = torch.tensor([torch.cuda.max_memory_allocated(device) / 1024 ** 3])
+            # 注意张量要建在 GPU 上：NCCL 后端不接受 CPU 张量做 all_reduce
+            # （8 卡首跑就是在这里崩的：RuntimeError: No backend type associated with device type cpu）
+            peak_gb = torch.tensor(
+                [torch.cuda.max_memory_allocated(device) / 1024 ** 3],
+                device=device,
+            )
             if world_size > 1:
                 import torch.distributed as dist
 
