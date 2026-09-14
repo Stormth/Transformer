@@ -136,3 +136,36 @@ def test_sampler_orders_by_length_inside_batch(tokenizer, tmp_path) -> None:
     for batch in sampler:
         lengths = [sum(dataset.length(i)) for i in batch]
         assert max(lengths) <= 4 * max(1, min(lengths)) + 8
+
+
+def test_sampler_splits_batches_across_ranks(tokenizer, tmp_path) -> None:
+    """多卡时每个 rank 拿到的 batch 必须"等量、不重叠、并起来接近全集"。
+
+    等量是硬要求：只要有一个 rank 先跑完，它就会在 all-reduce 里等死（DDP 经典死锁）。
+    """
+
+    pairs = toy_pairs(300, seed=9)
+    path = tmp_path / "toy.pt"
+    _write_split(path, tokenizer, pairs)
+    dataset = ParallelTextDataset(path)
+
+    def collect(rank: int, world_size: int) -> list:
+        sampler = LengthBucketSampler(
+            dataset, max_tokens=400, max_sentences=16, bucket_size=8,
+            shuffle=True, seed=0, rank=rank, world_size=world_size,
+        )
+        assert len(sampler) == len(list(iter(sampler)))
+        return [list(batch) for batch in sampler]
+
+    single = collect(0, 1)
+    rank0, rank1 = collect(0, 2), collect(1, 2)
+
+    # batch 数必须相等（句子数可以不等：每个 batch 的句子数本来就不一样）
+    assert len(rank0) == len(rank1)
+
+    flat0 = [index for batch in rank0 for index in batch]
+    flat1 = [index for batch in rank1 for index in batch]
+    flat_single = [index for batch in single for index in batch]
+    assert set(flat0).isdisjoint(flat1)              # 两张卡不重叠
+    assert set(flat0) | set(flat1) <= set(flat_single)   # 都来自全集
+    assert len(rank0) + len(rank1) >= len(single) - 2     # 只可能丢掉末尾一两个 batch

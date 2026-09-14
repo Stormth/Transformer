@@ -108,6 +108,7 @@ def save_checkpoint(
     history: Optional[List[Dict[str, float]]] = None,
     vocab_path: str = "data/ready/vocab.json",
     save_rng: bool = True,
+    save_optimizer: bool = True,
 ) -> Path:
     path = Path(path)
     ensure_dir(path.parent)
@@ -115,7 +116,9 @@ def save_checkpoint(
         "format": CHECKPOINT_FORMAT,
         "config": config.to_dict(),
         "model": model.state_dict(),
-        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        # 快照（用于最后做 checkpoint 平均）不需要优化器状态：
+        # Adam 的两个动量占了 2/3 的体积，存下来只是浪费磁盘。
+        "optimizer": optimizer.state_dict() if (optimizer is not None and save_optimizer) else None,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "scaler": scaler.state_dict() if scaler is not None else None,
         "epoch": epoch,

@@ -2,11 +2,9 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# 语料：用 python -m nmt.corpus 重新下载即可，不该进仓库（几十 MB 的压缩包 + 上百万行文本）
-data/raw/
-data/ready/
-data/processed/
-data/processed_*/
+# 语料：全部可以用 python -m nmt.corpus 重新生成，不该进仓库
+# （raw/ 是几十 MB 的压缩包，ready/ 是上百万行的文本和张量）
+data/
 
 # 训练产物：用 python -m nmt.train / python -m nmt.inspect 重新生成
 checkpoints/

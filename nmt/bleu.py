@@ -40,10 +40,15 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 _WORD = re.compile(r"[^\W\d_]+|\d+(?:[.,]\d+)*")
 
 
-def tokenize_for_bleu(text: str) -> List[str]:
-    """BLEU 用的切分：转小写，只保留字母串和数字串，标点丢掉。"""
+def tokenize_for_bleu(text: str, lowercase: bool = True) -> List[str]:
+    """BLEU 用的切分：只保留字母串和数字串，标点丢掉。
 
-    return _WORD.findall(text.lower())
+    lowercase 默认 True。但**和论文比分数时要设成 False**：
+    WMT14 的官方口径（sacrebleu 的 `case.mixed`）是区分大小写的，
+    转小写会让专有名词、句首大写都不计入差异，分数通常会偏高 1~2 分。
+    """
+
+    return _WORD.findall(text.lower() if lowercase else text)
 
 
 def _extract_ngrams(tokens: Sequence[str], order: int) -> Counter:
@@ -71,6 +76,7 @@ def corpus_bleu(
     hypotheses: Sequence[str],
     references: Sequence[str],
     max_order: int = 4,
+    lowercase: bool = True,
 ) -> BLEUScore:
     """语料级 BLEU。
 
@@ -89,8 +95,8 @@ def corpus_bleu(
     ref_len_total = 0
 
     for hypothesis, reference in zip(hypotheses, references):
-        hyp_tokens = tokenize_for_bleu(hypothesis)
-        ref_tokens = tokenize_for_bleu(reference)
+        hyp_tokens = tokenize_for_bleu(hypothesis, lowercase=lowercase)
+        ref_tokens = tokenize_for_bleu(reference, lowercase=lowercase)
         hyp_len_total += len(hyp_tokens)
         ref_len_total += len(ref_tokens)
 
@@ -177,10 +183,11 @@ def corpus_chrf(
 def evaluate_all(
     hypotheses: Sequence[str],
     references: Sequence[str],
+    lowercase: bool = True,
 ) -> Dict[str, float]:
     """一次算出训练监控常用的几个数。"""
 
-    bleu = corpus_bleu(hypotheses, references)
+    bleu = corpus_bleu(hypotheses, references, lowercase=lowercase)
     return {
         "bleu": bleu.bleu,
         "chrf": corpus_chrf(hypotheses, references),

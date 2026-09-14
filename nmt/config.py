@@ -89,8 +89,10 @@ class TrainConfig:
     eval_every_epochs: int = 1
     eval_max_sentences: int = 400      # 验证时最多解码多少句（解码比训练慢得多）
     eval_beam_size: int = 1            # 验证阶段先用贪心，快
+    bleu_lowercase: bool = True        # BLEU 是否转小写。和论文比分数时要设成 False
     log_every_steps: int = 50
     save_every_epochs: int = 1
+    keep_last_checkpoints: int = 0     # >0 时每个 epoch 额外存一份快照，用于最后做 checkpoint 平均
     patience: int = 0                  # >0 时，验证 BLEU 连续多少轮不涨就早停
     tensorboard: bool = False          # 需要额外 pip install tensorboard
 
@@ -225,10 +227,71 @@ def base_config(vocab_size: int = 16000) -> Config:
     )
 
 
+def paper_base_config(vocab_size: int = 32000) -> Config:
+    """论文 base 的完整配置（WMT14 英德，8×P100 训 12 小时 / 10 万步，27.3 BLEU）。
+
+    和 paper_big 一起对应《Attention Is All You Need》表 2 的两个模型。
+    关键超参都对上了论文：
+        d_model=512、8 头、6+6 层、d_ff=2048、dropout 0.1
+        标签平滑 0.1、Adam(0.9, 0.98, 1e-9)、Noam 学习率、warmup 4000
+        每批约 25k 源 token + 25k 目标 token（本项目的 max_tokens 按源+目标合计算）
+    """
+
+    config = base_config(vocab_size)
+    config.train.max_tokens = 50000      # 论文的批大小，注意这是**全局**预算
+    config.train.max_sentences = 512
+    config.train.warmup_steps = 4000
+    config.train.lr_scale = 1.0          # 峰值 = 512^-0.5 × 4000^-0.5 ≈ 7e-4，正是论文那个数
+    config.train.epochs = 1000           # 实际用 --max-steps 控制（论文是 100k 步）
+    config.train.eval_max_sentences = 1000
+    config.train.keep_last_checkpoints = 5   # 论文报的分数是最后 5 个 checkpoint 的平均
+    config.train.bleu_lowercase = False      # 对齐 WMT14 官方的区分大小写口径
+    return config
+
+
+def paper_big_config(vocab_size: int = 32000) -> Config:
+    """论文 big：d_model=1024、16 头、d_ff=4096、2.13 亿参数，30 万步、3.5 天、28.4 BLEU。
+
+    和论文的一处已知偏差：论文 big 也用约 25k+25k token 的批，但 2017 年的 P100 是 16 GB
+    显存；24 GB 的 4090 直接开 50k token 的批很容易 OOM。这里用 16k 批 + 2 次梯度累积
+    （等效 32k），显存够的话可以把 max_tokens 调大、accum_steps 调回 1。
+    另外 dropout 按论文 big 的 0.3。
+    """
+
+    return Config(
+        model=ModelConfig(
+            src_vocab_size=vocab_size,
+            tgt_vocab_size=vocab_size,
+            d_model=1024,
+            n_heads=16,
+            num_encoder_layers=6,
+            num_decoder_layers=6,
+            d_ff=4096,
+            dropout=0.3,
+            max_len=256,
+        ),
+        train=TrainConfig(
+            max_src_len=192,
+            max_tgt_len=192,
+            max_tokens=16384,
+            max_sentences=256,
+            accum_steps=2,
+            epochs=1000,
+            warmup_steps=4000,
+            lr_scale=1.0,
+            eval_max_sentences=1000,
+            keep_last_checkpoints=5,
+            bleu_lowercase=False,
+        ),
+    )
+
+
 PRESETS = {
     "tiny": tiny_config,
     "small": small_config,
     "base": base_config,
+    "paper-base": paper_base_config,
+    "paper-big": paper_big_config,
 }
 
 

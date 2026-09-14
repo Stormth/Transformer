@@ -73,7 +73,17 @@ class ParallelTextDataset(Dataset):
 
 
 class LengthBucketSampler:
-    """先按长度分桶，再按 token 预算组 batch。用法和普通 sampler 一样。"""
+    """先按长度分桶，再按 token 预算组 batch。用法和普通 sampler 一样。
+
+    多卡（DDP）时会用到 rank / world_size：所有 rank 用**同一个随机种子**
+    建出同一份 batch 列表，然后第 r 张卡只取第 r, r+world_size, ... 个 batch。
+    这样每张卡的数据互不重叠，合起来正好等于单卡时的一整个 epoch。
+
+    两个容易踩的坑：
+      * 所有 rank 必须建出完全一样的列表（种子、epoch 都要一致），否则切片错位；
+      * 必须让每张卡拿到的 batch **数量相同** —— 末尾除不尽的几个 batch 直接丢掉，
+        否则先跑完的卡会在 all-reduce 里等死（DDP 最经典的死锁）。
+    """
 
     def __init__(
         self,
@@ -85,6 +95,8 @@ class LengthBucketSampler:
         seed: int = 2024,
         max_src_len: int = 0,
         max_tgt_len: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> None:
         self.dataset = dataset
         self.max_tokens = max(1, max_tokens)
@@ -93,6 +105,8 @@ class LengthBucketSampler:
         self.shuffle = shuffle
         self.seed = seed
         self.epoch = 0
+        self.rank = rank
+        self.world_size = max(1, world_size)
 
         # 过滤掉超出长度上限的句子（数据准备时已经卡过一道，这里是双保险）
         indices: List[int] = []
@@ -161,18 +175,47 @@ class LengthBucketSampler:
     def __len__(self) -> int:
         if self._cache is None:
             self._cache = self._build()
-        return len(self._cache)
+        return self._num_local_batches()
+
+    def _num_local_batches(self) -> int:
+        """本 rank 负责的 batch 数：总数整除 world_size（余数丢掉，保证各卡等量）。"""
+
+        assert self._cache is not None
+        return len(self._cache) // self.world_size
 
     def __iter__(self) -> Iterator[List[int]]:
         if self._cache is None:
             self._cache = self._build()
-        for batch in self._cache:
+        usable = self._num_local_batches() * self.world_size
+        for batch in self._cache[self.rank : usable : self.world_size]:
             yield [self.indices[position] for position in batch]
 
     # ------------------------------------------------------------ 信息
     @property
     def num_pairs(self) -> int:
         return len(self.indices)
+
+
+def truncate_pair(
+    src_ids: torch.Tensor,
+    tgt_ids: torch.Tensor,
+    max_len: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """把超过位置编码上限的句子截短，保留末尾的 <eos>。
+
+    数据准备阶段已经按 token 数过滤过一遍（`--max-src-len` / `--max-tgt-len`），
+    但那个上限和模型的位置编码上限是两个独立的旋钮，配错时就会在 forward 里报
+    "序列长度 N 超过了位置编码支持的最大长度 M"。
+
+    做法是取前 max_len-1 个 token、再把最后一个 token（也就是 <eos>）接回去，
+    这样截断后的句子仍然以 <eos> 结尾，是个"合法的句子"。
+    """
+
+    if src_ids.numel() > max_len:
+        src_ids = torch.cat([src_ids[: max_len - 1], src_ids[-1:]])
+    if tgt_ids.numel() > max_len:
+        tgt_ids = torch.cat([tgt_ids[: max_len - 1], tgt_ids[-1:]])
+    return src_ids, tgt_ids
 
 
 def collate_batch(
@@ -213,6 +256,8 @@ def build_dataloader(
     seed: int = 2024,
     max_src_len: int = 0,
     max_tgt_len: int = 0,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Tuple[DataLoader, LengthBucketSampler]:
     """组装 DataLoader：采样器负责组 batch，collate 负责 padding。"""
 
@@ -225,6 +270,8 @@ def build_dataloader(
         seed=seed,
         max_src_len=max_src_len,
         max_tgt_len=max_tgt_len,
+        rank=rank,
+        world_size=world_size,
     )
     loader = DataLoader(
         dataset,

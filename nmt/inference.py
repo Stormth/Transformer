@@ -14,10 +14,12 @@ import torch
 from .bpe import BPE
 from .checkpoint import config_from_checkpoint, load_checkpoint
 from .decoding import beam_search_decode, greedy_decode
-from .dataset import collate_batch
+from .dataset import collate_batch, truncate_pair
 from .masks import make_encoder_attn_mask
 from .model import Transformer
-from .utils import resolve_device
+from .utils import get_logger, resolve_device
+
+logger = get_logger()
 
 
 def select_eval_indices(total: int, limit: int) -> List[int]:
@@ -81,8 +83,15 @@ def translate_dataset(
         batches.append(current)
 
     hypotheses: Dict[int, str] = {}
+    truncate_limit = int(getattr(model.config, "max_len", 512))
+    truncated = 0
     for done, batch_indices in enumerate(batches, start=1):
-        samples = [dataset[index] for index in batch_indices]
+        samples = []
+        for index in batch_indices:
+            src_ids, tgt_ids = dataset[index]
+            if src_ids.numel() > truncate_limit:
+                truncated += 1
+            samples.append(truncate_pair(src_ids, tgt_ids, truncate_limit))
         collated = collate_batch(samples, pad_id)
         src = collated["src"].to(device)
         src_mask = make_encoder_attn_mask(src, pad_id)
@@ -108,6 +117,8 @@ def translate_dataset(
         if progress is not None:
             progress(done, len(batches))
 
+    if truncated:
+        logger.warning(f"有 {truncated} 句原文超过了位置编码上限 {truncate_limit}，已截断")
     return [hypotheses[index] for index in selected]
 
 
@@ -156,7 +167,15 @@ class Translator:
     # ------------------------------------------------------------------ 编码
     def encode(self, texts: Sequence[str]) -> tuple[torch.Tensor, torch.Tensor]:
         pad_id = self.tokenizer.pad_id
-        sequences = [self.tokenizer.encode(text, add_eos=True) for text in texts]
+        # 位置编码有长度上限，超长的输入必须截断（保留末尾的 <eos>），
+        # 否则 forward 会直接抛 ValueError。评测时过长句被截断是常规做法。
+        limit = self.config.model.max_len
+        sequences = []
+        for text in texts:
+            ids = self.tokenizer.encode(text, add_eos=True)
+            if len(ids) > limit:
+                ids = ids[: limit - 1] + [ids[-1]]
+            sequences.append(ids)
         lengths = torch.tensor([len(s) for s in sequences], dtype=torch.long)
         batch = torch.full((len(sequences), int(lengths.max())), pad_id, dtype=torch.long)
         for row, ids in enumerate(sequences):

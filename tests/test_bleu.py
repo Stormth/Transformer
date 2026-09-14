@@ -68,3 +68,15 @@ def test_chrf_range() -> None:
     value = corpus_chrf(hypotheses, references)
     assert 0.0 <= value <= 100.0
     assert value > 70.0     # 两句几乎一样，chrF 应该很高
+
+
+def test_case_sensitive_bleu_is_stricter() -> None:
+    """区分大小写时，大小写不同的译文会被扣分（WMT14 官方口径就是这样）。"""
+
+    reference = ["Der Ingenieur bespricht das Problem morgen in der Schule."]
+    hypothesis = ["der ingenieur bespricht das problem morgen in der schule."]
+
+    loose = corpus_bleu(hypothesis, reference, lowercase=True).bleu
+    strict = corpus_bleu(hypothesis, reference, lowercase=False).bleu
+    assert loose > 99.0      # 只差大小写，转小写后完全一致
+    assert strict < 60.0     # 区分大小写就露馅了

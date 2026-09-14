@@ -65,6 +65,7 @@ def run_once(
     beam_size: int,
     max_sentences: int,
     batch_tokens: int = 4096,
+    lowercase: bool = True,
 ) -> Tuple[Dict[str, float], List[str], List[int], List[str]]:
     indices = select_eval_indices(len(dataset), max_sentences)
     with Timer() as timer:
@@ -75,7 +76,7 @@ def run_once(
         )
     references = read_lines(data_dir / f"{split}.ref.de")
     references = [references[index] for index in indices]
-    metrics = evaluate_all(hypotheses, references)
+    metrics = evaluate_all(hypotheses, references, lowercase=lowercase)
     metrics["seconds"] = timer.elapsed
     metrics["sentences"] = float(len(indices))
     metrics["beam_size"] = float(beam_size)
@@ -96,6 +97,10 @@ def main() -> None:
     parser.add_argument("--max-sentences", type=int, default=0, help="只评这么多句（0=全部）")
     parser.add_argument("--batch-tokens", type=int, default=4096)
     parser.add_argument("--device", default="auto")
+    parser.add_argument(
+        "--case-sensitive", action="store_true",
+        help="BLEU 区分大小写。WMT14 官方口径就是这个，和论文比分数时要加这个开关",
+    )
     parser.add_argument("--save-pred", default=None, help="把译文写到文件")
     parser.add_argument("--show", type=int, default=5, help="打印前几句对照（0=不打印）")
     parser.add_argument(
@@ -112,6 +117,17 @@ def main() -> None:
     )
     logger.info(f"数据 {args.split}（{len(dataset)} 句）| 模型来自 {args.checkpoint}")
 
+    # 数据里的 token id 必须落在模型的词表范围内。
+    # 踩这个坑的典型方式是：模型在 data/tiny 上训的，评测时忘了改 --data-dir，
+    # 于是用另一套词表的 id 去查嵌入表，CUDA 直接抛 device-side assert（报错信息还很难懂）。
+    max_id = int(dataset.src.max())
+    if max_id >= len(translator.tokenizer):
+        raise SystemExit(
+            f"{args.split} 里的 token id 最大是 {max_id}，但模型词表只有 "
+            f"{len(translator.tokenizer)} 个 token —— 数据和模型用的不是同一套词表。\n"
+            f"请检查 --data-dir（现在是 {args.data_dir}）是不是训练时用的那个目录。"
+        )
+
     if args.compare_decoders:
         logger.info("=" * 68)
         logger.info("解码策略对比（同一批句子，只换解码方式）")
@@ -120,6 +136,7 @@ def main() -> None:
             metrics, _, _, _ = run_once(
                 translator, dataset, args.split, data_dir,
                 beam_size=beam, max_sentences=args.max_sentences, batch_tokens=args.batch_tokens,
+                lowercase=not args.case_sensitive,
             )
             results.append(metrics)
             label = "贪心" if beam == 1 else f"束搜索 K={beam}"
@@ -136,6 +153,7 @@ def main() -> None:
         translator, dataset, args.split, data_dir,
         beam_size=max(1, args.beam_size), max_sentences=args.max_sentences,
         batch_tokens=args.batch_tokens,
+        lowercase=not args.case_sensitive,
     )
 
     logger.info("=" * 68)

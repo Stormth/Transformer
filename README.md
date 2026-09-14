@@ -62,6 +62,25 @@ python -m pytest tests -q
 
 **笔记本 / 显存小**：用 `--preset small`（d_model=256，3+3 层）或 `--preset tiny`（冒烟测试）。
 
+## 复现论文（8 卡）
+
+如果你想复现《Attention Is All You Need》的英德结果（newstest2014 上 27.3 BLEU），
+完整流程写在 [docs/12-reproduce.md](docs/12-reproduce.md)，命令是这三条：
+
+```bash
+# 1) 论文设置的数据：Europarl v7 + Common Crawl + News Commentary v9，456 万句对（1~2 小时）
+python -m nmt.corpus --recipe wmt14
+
+# 2) 8 卡训练（论文 base：100k 步、50k token 批、warmup 4000；8×4090 约 3~6 小时）
+torchrun --nproc_per_node=8 -m nmt.train --preset paper-base --max-steps 100000
+
+# 3) 论文口径的评测：最后 5 个 checkpoint 平均 + beam 4 + 区分大小写 BLEU
+python -m nmt.average --checkpoint-dir checkpoints --num 5
+python -m nmt.evaluate --checkpoint checkpoints/averaged.pt --split test2014 --beam-size 4 --case-sensitive
+```
+
+`--preset paper-big` 是论文的大模型（d_model 1024、16 头、2.13 亿参数，28.4 BLEU，8×4090 约 10~20 小时）。
+
 ## 数据集划分
 
 | split | 来源 | 句数 | 用途 |
@@ -107,6 +126,7 @@ python -m pytest tests -q
 | [第 9 章](docs/09-evaluation.md) | BLEU / chrF 与诚实的评测 | `bleu.py`、`evaluate.py` |
 | [第 10 章](docs/10-experiments.md) | 可以动手的实验清单 | — |
 | [第 11 章](docs/11-faq.md) | 常见坑与排错 | — |
+| [第 12 章](docs/12-reproduce.md) | **复现论文的英德结果（8 卡）** | `average.py`、DDP |
 
 ## 项目结构
 
@@ -128,6 +148,7 @@ python -m pytest tests -q
 │   ├── decoding.py         贪心 / 束搜索
 │   ├── bleu.py             BLEU-4 / chrF
 │   ├── checkpoint.py       保存与恢复
+│   ├── average.py          最后 N 个 checkpoint 权重平均（论文的做法）
 │   ├── train.py            训练循环
 │   ├── evaluate.py         评测
 │   ├── translate.py        命令行翻译
