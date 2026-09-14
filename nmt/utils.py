@@ -20,11 +20,34 @@ import torch
 # --------------------------------------------------------------------------
 # 控制台 / 日志
 # --------------------------------------------------------------------------
+class _LiveStderrHandler(logging.Handler):
+    """每条日志都现取 sys.stderr、用 print 写出来并立刻 flush。
+
+    为什么不直接用 logging.StreamHandler(sys.stderr)？
+    因为 torchrun 这类启动器会替换/包装 sys.stderr，而 StreamHandler 在构造时
+    就把 stream 对象抓死了 —— 结果是多卡训练时日志静默消失：
+    屏幕上只有 warning，看不到 loss / tok/s / 验证分数，
+    人会以为"是不是没在跑"。（这个坑在本项目的 8 卡首跑里真实发生过。）
+
+    每次 emit 时重新取 sys.stderr，行为就和普通的 print(..., file=sys.stderr) 完全一致。
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            print(self.format(record), file=sys.stderr, flush=True)
+        except Exception:  # 日志本身不该把训练搞崩
+            self.handleError(record)
+
+
 def setup_console() -> None:
-    """把标准输出切成 UTF-8。
+    """把标准输出切成 UTF-8，并让已经建好的 logger 重新绑定到当前的 stderr。
 
     Windows 控制台默认是 GBK，打印中文/德语等非 ASCII 日志时可能乱码甚至直接抛
     UnicodeEncodeError。所有入口脚本第一件事就调用它。
+
+    为什么要重新绑定 handler？因为 torchrun 这类启动器会在进程启动后**替换**
+    sys.stdout / sys.stderr。如果 handler 还攥着旧对象，日志就会静默消失 ——
+    表现是"8 卡跑起来了，但屏幕上什么都没有，不知道在不在跑"。这个坑踩过一次。
     """
 
     for stream in (sys.stdout, sys.stderr):
@@ -33,13 +56,29 @@ def setup_console() -> None:
         except (AttributeError, ValueError):
             pass
 
+    for name in list(logging.root.manager.loggerDict):
+        if name != "nmt" and not name.startswith("nmt."):
+            continue
+        logger = logging.getLogger(name)
+        for handler in list(logger.handlers):
+            if isinstance(handler, logging.StreamHandler):
+                logger.removeHandler(handler)
+        handler = _LiveStderrHandler()
+        handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
+        logger.addHandler(handler)
+
 
 def get_logger(name: str = "nmt", level: int = logging.INFO) -> logging.Logger:
-    """返回一个只打一行、带时间戳的 logger。"""
+    """返回一个只打一行、带时间戳的 logger。
+
+    注意日志走的是 **stderr** 而不是 stdout：torchrun 只转发子进程的 stderr，
+    写 stdout 的日志在多卡运行时会被吞掉 —— 表现就是"8 卡跑起来了，但屏幕上
+    只有一个 warning，完全不知道训练进度"。这个坑踩过一次。
+    """
 
     logger = logging.getLogger(name)
     if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
+        handler = _LiveStderrHandler()
         handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%H:%M:%S"))
         logger.addHandler(handler)
     logger.setLevel(level)

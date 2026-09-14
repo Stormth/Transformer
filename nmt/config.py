@@ -92,6 +92,7 @@ class TrainConfig:
     bleu_lowercase: bool = True        # BLEU 是否转小写。和论文比分数时要设成 False
     log_every_steps: int = 50
     save_every_epochs: int = 1
+    save_every_steps: int = 0          # >0 时每隔这么多步存一次 last.pt（长时间训练强烈建议开）
     keep_last_checkpoints: int = 0     # >0 时每个 epoch 额外存一份快照，用于最后做 checkpoint 平均
     patience: int = 0                  # >0 时，验证 BLEU 连续多少轮不涨就早停
     tensorboard: bool = False          # 需要额外 pip install tensorboard

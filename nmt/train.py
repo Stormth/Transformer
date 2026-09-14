@@ -476,6 +476,22 @@ def train(
                     f"tok/s {epoch_tokens / max(1e-6, elapsed):,.0f}"
                 )
 
+            # 按步存盘：大语料下一个 epoch 可能一小时，只在轮末存的话一旦崩掉就白跑。
+            # 长训练建议开成几千步一存（--override train.save_every_steps=2000）。
+            if (
+                is_main
+                and train_cfg.save_every_steps
+                and global_step % train_cfg.save_every_steps == 0
+            ):
+                save_checkpoint(
+                    save_dir / "last.pt",
+                    model=raw_model, config=config, optimizer=optimizer,
+                    scheduler=scheduler, scaler=scaler, epoch=epoch + 1,
+                    step=global_step, best_score=best_score, history=history,
+                    vocab_path=str(data_dir / "vocab.json"),
+                )
+                logger.info(f"  按 --save-every-steps 保存了 last.pt（第 {global_step} 步）")
+
             if max_steps and global_step >= max_steps:
                 logger.info(f"到达 --max-steps={max_steps}，提前结束本轮")
                 break
