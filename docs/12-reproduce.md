@@ -61,16 +61,61 @@ torchrun --nproc_per_node=8 -m nmt.train \
 
 ## 3. 正式训练（3~6 小时）
 
+### 先挂到后台再启动（重要）
+
+**不要直接在前台跑。** SSH 断线、frp / 跳板机抖动、笔记本合盖、家里网断了——
+任何一个都会把进程带走，几小时的训练直接报废。用 `tmux` / `screen` / `zellij` / `nohup`
+任意一种把它扔到后台：
+
 ```bash
-# 用 nohup 挂后台，避免 SSH 断开把训练带走
+# 方式一：tmux（推荐，随时能回去看实时日志）
+tmux new -s train
+torchrun --nproc_per_node=8 -m nmt.train \
+    --preset paper-base --max-steps 100000 --save-dir checkpoints \
+    --override train.save_every_steps=2000 \
+    2>&1 | tee train_console.log
+# 按 Ctrl+B 再按 D 脱离；之后 tmux attach -t train 回到这个会话
+# 查看所有会话：tmux ls
+
+# 方式二：screen（几乎每台服务器都自带）
+screen -S train
+torchrun --nproc_per_node=8 -m nmt.train --preset paper-base --max-steps 100000 \
+    2>&1 | tee train_console.log
+# 按 Ctrl+A 再按 D 脱离；screen -r train 回来
+
+# 方式三：nohup（最轻量，不需要装任何东西）
 nohup torchrun --nproc_per_node=8 -m nmt.train \
     --preset paper-base \
     --max-steps 100000 \
     --save-dir checkpoints \
     > train_console.log 2>&1 &
 
-tail -f train_console.log      # 看进度
+tail -f train_console.log      # 随时看进度
 ```
+
+三个要点：
+
+1. **一定要用 `tee` 或 `>` 留一份日志文件**。终端会话丢了还能从文件看进度，
+   而且出问题时可以直接把这个文件发出来。
+2. **`--override train.save_every_steps=2000`**：万一真的被杀掉，最多只丢 2000 步。
+3. **别用 `kill -9` 直接杀 torchrun**。8 个 worker 常常不会跟着退出，
+   残留进程会一直占着显存 —— 下次启动就会莫名其妙 OOM（本项目的首跑就是这么栽的：
+   一张 24 GB 的卡显示只剩 33 MB 空闲，而模型本身只需要 5~6 GB）。
+   正确做法是 `pkill -f "nmt.train"`，等 5 秒，再用 `nvidia-smi` 确认显存真的释放了。
+
+### 万一还是断了
+
+```bash
+# 看它还活着没有
+gpustat                      # 或者 nvidia-smi
+ps aux | grep nmt.train
+tail -20 train_console.log
+
+# 从最近的 checkpoint 接着训（最多丢 save_every_steps 步）
+torchrun --nproc_per_node=8 -m nmt.train --preset paper-base --resume auto --max-steps 100000
+```
+
+续训要求 checkpoint 目录里同时有 `last.pt` 和 `vocab.json`（训练脚本会自动把词表复制过去）。
 
 两个常用的续训命令：
 

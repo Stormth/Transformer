@@ -73,7 +73,11 @@ python -m pytest tests -q
 python -m nmt.corpus --recipe wmt14
 
 # 2) 8 卡训练（论文 base：100k 步、50k token 批、warmup 4000；8×4090 约 3~6 小时）
-torchrun --nproc_per_node=8 -m nmt.train --preset paper-base --max-steps 100000
+#    ⚠️ 长时间训练必须挂后台：SSH / frp / 跳板机一断，前台进程就被带走，几小时白跑
+tmux new -s train      # 或者 screen -S train / nohup ...
+torchrun --nproc_per_node=8 -m nmt.train --preset paper-base --max-steps 100000 \
+    --override train.save_every_steps=2000 2>&1 | tee train_console.log
+# 按 Ctrl+B 再按 D 脱离；回来用 tmux attach -t train
 
 # 3) 论文口径的评测：最后 5 个 checkpoint 平均 + beam 4 + 区分大小写 BLEU
 python -m nmt.average --checkpoint-dir checkpoints --num 5
@@ -81,6 +85,10 @@ python -m nmt.evaluate --checkpoint checkpoints/averaged.pt --split test2014 --b
 ```
 
 `--preset paper-big` 是论文的大模型（d_model 1024、16 头、2.13 亿参数，28.4 BLEU，8×4090 约 10~20 小时）。
+
+断线了也别慌：`--resume auto` 会从最近的 checkpoint 接着训（配合 `--save-every-steps`
+最多丢几千步）。**但别用 `kill -9` 直接杀 torchrun**——worker 残留会一直占着显存，
+下次启动就会莫名 OOM，见 [第 12 章排错](docs/12-reproduce.md)。
 
 ## 数据集划分
 
