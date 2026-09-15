@@ -7,7 +7,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from nmt.loss import LabelSmoothingLoss, build_criterion
+from nmt.loss import LabelSmoothingLoss, PlainCrossEntropy, build_criterion
 
 
 def test_smoothing_zero_equals_cross_entropy() -> None:
@@ -66,3 +66,28 @@ def test_smoothing_has_a_positive_floor() -> None:
     expected = -(distribution * log_probs).sum()
     assert torch.allclose(loss, expected, atol=1e-5)
     assert loss.item() > 0.1
+
+
+def test_chunked_loss_equals_single_pass() -> None:
+    """分块计算必须和一次性计算逐位一致 —— 分块只是为了省显存，不该改变数值。"""
+
+    torch.manual_seed(0)
+    logits = torch.randn(2, 7, 13)
+    target = torch.randint(0, 13, (2, 7))
+    target[0, 5:] = 0      # 混入 padding
+
+    whole = LabelSmoothingLoss(vocab_size=13, pad_id=0, smoothing=0.1, chunk_tokens=1024)
+    chunked = LabelSmoothingLoss(vocab_size=13, pad_id=0, smoothing=0.1, chunk_tokens=3)
+    assert torch.allclose(whole(logits, target), chunked(logits, target), atol=1e-6)
+
+    plain_whole = PlainCrossEntropy(pad_id=0, chunk_tokens=1024)
+    plain_chunked = PlainCrossEntropy(pad_id=0, chunk_tokens=2)
+    assert torch.allclose(plain_whole(logits, target), plain_chunked(logits, target), atol=1e-6)
+
+
+def test_chunked_loss_gradients_flow() -> None:
+    logits = torch.randn(1, 6, 11, requires_grad=True)
+    target = torch.randint(0, 11, (1, 6))
+    LabelSmoothingLoss(vocab_size=11, pad_id=0, smoothing=0.1, chunk_tokens=2)(logits, target).backward()
+    assert logits.grad is not None
+    assert logits.grad.abs().sum() > 0

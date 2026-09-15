@@ -215,11 +215,34 @@ sleep 5 && nvidia-smi                               # 确认卡空了再重跑
 ```bash
 --override train.max_tokens=32768          # 全局批减半
 --override train.accum_steps=2             # 用梯度累积补回等效批大小
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # 动态 batching 的形状变化多，缓解碎片
 ```
 
 训练时每轮会打印**各卡峰值显存**。如果这个数字随轮数缓慢上涨 → 是碎片或泄漏；
 如果某一轮突然跳上去 → 是某个 batch 异常大，看 `train_log.csv` 里那一轮的长度分布。
+
+### 显存"越跑越多"：先想到碎片
+
+**动态 batching 是碎片的温床**：每一步的 batch 形状都不一样，缓存块对不上号，
+碎片越攒越多，跑几小时后 `nvidia-smi` 上的占用会比刚启动时高一倍。
+本项目的 8 卡首跑就是这样：21:37 每卡 9~16 GB，23:56 变成 25.2 GB 只剩 31 MB，
+再过两小时另一张卡也爆一次 —— 但 step 的显存需求其实一直没变。
+
+**根治办法是把分配器换成可扩展段**（PyTorch 2.1+）：
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun --nproc_per_node=8 -m nmt.train --preset paper-base --max-steps 100000
+```
+
+想确认是不是碎片，用这条盯着看（正常情况下应该平掉，一直涨就是碎片或泄漏）：
+
+```bash
+watch -n 30 'nvidia-smi --query-gpu=index,memory.used --format=csv,noheader'
+```
+
+配套的代码侧还有两件事已经做掉了：损失函数**分块计算**（不再一次性持有
+`[token 数, 词表大小]` 的巨块张量，峰值只跟 chunk 大小有关），以及每步的
+GPU 同步全部去掉（同步会把流水线排空，既慢又推高峰值占用）。
 
 ### 报错说"序列长度 N 超过了位置编码支持的最大长度"
 

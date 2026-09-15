@@ -21,13 +21,25 @@ import torch.nn.functional as F
 class LabelSmoothingLoss(nn.Module):
     """ignore_index（<pad>）位置不产生 loss。"""
 
-    def __init__(self, vocab_size: int, pad_id: int, smoothing: float = 0.1) -> None:
+    def __init__(
+        self,
+        vocab_size: int,
+        pad_id: int,
+        smoothing: float = 0.1,
+        chunk_tokens: int = 1024,
+    ) -> None:
         super().__init__()
         if not 0.0 <= smoothing < 1.0:
             raise ValueError("smoothing 必须在 [0, 1) 区间")
         self.vocab_size = vocab_size
         self.pad_id = pad_id
         self.smoothing = smoothing
+        # 分块计算：一次只处理这么多 token 的 logits。
+        # 不分块的话，[token 数, 词表大小] 这种张量会同时出现好几个
+        # （logits、log_probs、log_softmax 内部还会再翻一份 fp32），
+        # 32000 词表 + 5000 token 时单个就是 600 MB 以上 —— 多卡训练
+        # 在 24 GB 卡上很容易被它顶爆。分块后峰值跟 token 数无关，只跟 chunk 有关。
+        self.chunk_tokens = max(1, chunk_tokens)
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """logits: [B, T, V]（或 [N, V]）；target: [B, T]（或 [N]）。返回标量。
@@ -50,20 +62,30 @@ class LabelSmoothingLoss(nn.Module):
         """
 
         vocab_size = logits.size(-1)
-        logits = logits.reshape(-1, vocab_size)
-        target = target.reshape(-1)
+        flat_logits = logits.reshape(-1, vocab_size)
+        flat_target = target.reshape(-1)
 
-        log_probs = F.log_softmax(logits, dim=-1)
+        total = logits.new_zeros(())
+        n_valid = flat_target.new_zeros(())
+        for start in range(0, flat_logits.size(0), self.chunk_tokens):
+            chunk_logits = flat_logits[start : start + self.chunk_tokens]
+            chunk_target = flat_target[start : start + self.chunk_tokens]
 
-        valid = target != self.pad_id
-        # gather 出正确词的对数概率（padding 位置取到的是无关项，后面会被 mask 掉）
-        safe_target = target.masked_fill(~valid, 0)
-        nll = -log_probs.gather(dim=-1, index=safe_target.unsqueeze(-1)).squeeze(-1)
-        smooth = -log_probs.sum(dim=-1)
+            log_probs = F.log_softmax(chunk_logits, dim=-1)
+            valid = chunk_target != self.pad_id
+            # gather 出正确词的对数概率（padding 位置取到的是无关项，后面会被 mask 掉）
+            safe_target = chunk_target.masked_fill(~valid, 0)
+            nll = -log_probs.gather(dim=-1, index=safe_target.unsqueeze(-1)).squeeze(-1)
+            smooth = -log_probs.sum(dim=-1)
 
-        per_token = (1.0 - self.smoothing) * nll + self.smoothing / (vocab_size - 1) * (smooth - nll)
-        n_valid = valid.sum().clamp(min=1)
-        return (per_token * valid).sum() / n_valid
+            per_token = (
+                (1.0 - self.smoothing) * nll
+                + self.smoothing / (vocab_size - 1) * (smooth - nll)
+            )
+            total = total + (per_token * valid).sum()
+            n_valid = n_valid + valid.sum()
+
+        return total / n_valid.clamp(min=1)
 
 
 class PlainCrossEntropy(nn.Module):
@@ -74,12 +96,26 @@ class PlainCrossEntropy(nn.Module):
     所以这里统一拍平成 [B*T, V] / [B*T]，两个损失函数就能互换使用。
     """
 
-    def __init__(self, pad_id: int) -> None:
+    def __init__(self, pad_id: int, chunk_tokens: int = 1024) -> None:
         super().__init__()
-        self.loss = nn.CrossEntropyLoss(ignore_index=pad_id)
+        # reduction="sum"：分块求和之后统一除以有效 token 数，
+        # 用默认的 mean 会把"每块的均值"再加起来，权重就错了。
+        self.loss = nn.CrossEntropyLoss(ignore_index=pad_id, reduction="sum")
+        self.pad_id = pad_id
+        self.chunk_tokens = max(1, chunk_tokens)
 
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        return self.loss(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
+        flat_logits = logits.reshape(-1, logits.size(-1))
+        flat_target = target.reshape(-1)
+
+        total = logits.new_zeros(())
+        n_valid = flat_target.new_zeros(())
+        for start in range(0, flat_logits.size(0), self.chunk_tokens):
+            chunk_logits = flat_logits[start : start + self.chunk_tokens]
+            chunk_target = flat_target[start : start + self.chunk_tokens]
+            total = total + self.loss(chunk_logits, chunk_target)
+            n_valid = n_valid + (chunk_target != self.pad_id).sum()
+        return total / n_valid.clamp(min=1)
 
 
 def build_criterion(pad_id: int, vocab_size: int, smoothing: float) -> nn.Module:
